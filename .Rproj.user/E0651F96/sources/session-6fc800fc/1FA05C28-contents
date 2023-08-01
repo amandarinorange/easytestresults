@@ -238,7 +238,7 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
   intx_stats <- intx_plot$data %>%
     select(c(1,2,3)) %>%
-    rename(actual_rate = 1) %>%
+    dplyr::rename(est = 1) %>%
     left_join(y = em_c_comparison,
               by = setNames(c(user_segment,"reference"),
                             c(user_segment,treatment_name))) %>%

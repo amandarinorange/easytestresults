@@ -45,7 +45,7 @@ segment <- sample(segment_levels, n, replace = TRUE)
 # Create the data frame
 toydata <- data.frame(outcome_norm, outcome_binom, outcome_nbinom, condition, segment)
 
+toydata$segment <- as.factor(toydata$segment)
 
 save(toydata, file = "~/Documents/easytestresults//data/toydata.RData")
-df <- toydata
-colnames(df)
+
