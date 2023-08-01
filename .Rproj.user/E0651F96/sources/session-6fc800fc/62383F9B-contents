@@ -1,0 +1,2068 @@
+---
+title: "Holdout 2023 H1"
+output: html_document
+date: "2023-03-03"
+---
+
+```{r message=FALSE, warning=FALSE}
+`%notin%` <- Negate(`%in%`)
+require(diversitree)
+require(optimx)
+table <- set.defaults(table, useNA = c("ifany", "no"))
+require(ggeffects)
+require(emdbook)
+require(sjmisc)
+require(fitdistrplus)
+require(ggridges)
+require(jtools)
+require(sjstats)
+require(ggrepel)
+require(gtools)
+require(effects)
+require(forecast)
+require(dplyr)
+require(zoo)
+require(lubridate)
+require(ggpubr)
+require(sjPlot)
+require(stringi)
+require(RColorBrewer)
+require(stringr)
+require(summarytools)
+require(RMySQL)
+require(data.table)
+require(purrr)
+require(caret)
+require(Hmisc)
+require(ggplot2)
+require(magrittr)
+require(tidyverse)
+require(lme4)
+require(DBI)
+require(stringi)
+require(lmtest)
+require(lm.beta)
+require(oddstream)
+require(xts)
+require(changepoint)
+require(ggfortify)
+require(fitAR)
+require(forcast)
+require(astsa)
+require(AnomalyDetection)
+require(RVAideMemoire)
+require(DBI)
+require(RPostgreSQL)
+require(blscrapeR)
+require(lavaan)
+require(semPlot)
+require(piecewiseSEM)
+require(nlme)
+require(mgcv)
+require(survminer)
+require(corrplot)
+require(pscl)
+require(gamlss.data)
+```
+
+```{r}
+install.packages("Rserve")
+require(Rserve)
+Rserve(args="--no-save")
+library(jsonlite)
+
+Rserve::run.Rserve(debug = FALSE, port = 6311, auth=FALSE, args="--no-save", maxinbuf = 4194304)
+```
+
+
+```{r include=FALSE}
+#Connect to droid
+
+# Settings
+db_user <- 'amwang'
+db_password <- read_lines('~/redshift_pw.txt')
+db_name <- 'ancestry'
+db_host <- 'cdw' 
+db_port <- 5439
+
+```
+<!-- query -->
+```{r include=FALSE}
+#  Read data from db
+pg = dbDriver("PostgreSQL")
+cdw <-  dbConnect(pg, user = db_user, password = db_password,
+                 dbname = db_name, host = db_host, port = db_port)
+
+
+query <- "SELECT DISTINCT sm.ucdmid, 
+        CASE WHEN h.ucdmid IS NULL THEN 'no leakage events'
+            WHEN h.ucdmid IS NOT NULL THEN 'leakage events'
+            ELSE NULL
+            END AS leakage_events,
+        gsacohortwebserviceid, webserviceid, sm.holdout_group, enter_date, 
+        package_type, duration, email_type,
+        age,age_group,
+        ufrdate, retainedtocreatedate, cancel_date, netufrquantity, tvalue_num, renewal_flag,
+        MAX(active_this_day) as in_dau_table_this_tenure,
+        SUM(active_this_day)::FLOAT/count(*) as prop_days_in_dau_table,
+        MAX(in_session_summary_table) as in_ss_table_this_tenure,
+        SUM(in_session_summary_table)::FLOAT/count(*) as prop_days_in_ss_table,
+        MIN(lifetimetenureid) as min_lifetimetenureid
+FROM a.aw_h12023_subscribers_metrics sm
+LEFT JOIN a.aw_holdout_leak_ucdmids h
+  ON h.ucdmid = sm.ucdmid and h.holdout_group = sm.holdout_group
+WHERE tvalue_num < 4 and netufrquantity =1 
+GROUP BY sm.ucdmid, leakage_events, gsacohortwebserviceid, webserviceid, sm.holdout_group, enter_date, 
+        package_type, duration, email_type,age, age_group,
+        ufrdate, retainedtocreatedate, cancel_date, netufrquantity, tvalue_num, renewal_flag
+ORDER BY ucdmid, tvalue_num
+;"
+
+raw <- fetch(dbSendQuery(cdw, query), n = -1)
+
+
+query2 <- "select sm.*,
+      CASE WHEN h.ucdmid IS NULL THEN 'no leakage events'
+            WHEN h.ucdmid IS NOT NULL THEN 'leakage events'
+            ELSE NULL
+            END AS leakage_events
+from a.aw_h12023_subscribers_metrics_aggweek sm
+LEFT JOIN a.aw_holdout_leak_ucdmids h
+  ON h.ucdmid = sm.ucdmid and h.holdout_group = sm.holdout_group
+where tvalue_num < 4 
+    and (active_this_week = 1 or in_session_summary_table = 1)
+order by sm.ucdmid, week
+;
+"
+inputs <- fetch(dbSendQuery(cdw, query2), n = -1)
+
+
+```
+
+```{r}
+
+raw$date_diff <- round(as.numeric(difftime(raw$retainedtocreatedate, raw$ufrdate, units = "days")),2)
+inputs$date_diff <- round(as.numeric(difftime(inputs$retainedtocreatedate, inputs$ufrdate, units = "days")),2)
+
+table(raw$netufrquantity)
+table(raw$renewal_flag)
+table(raw$email_type)
+table(raw$leakage_events, raw$holdout_group) %>% prop.table(2)
+table(raw$leakage_events, raw$email_type) %>% prop.table(2)
+
+#View(raw[raw$email_type=="acomqa email",])
+
+table(inputs$netufrquantity)
+inputs$renewal_flag[inputs$netufrquantity==0] <- NA
+```
+
+
+```{r}
+colnames(raw)
+colnames(inputs)
+head(raw,20)
+table(raw$duration) %>% prop.table()*100
+table(raw$tvalue_num) %>% prop.table()*100
+table(raw$prev_holdout_group) %>% prop.table()*100
+table(raw$tvalue_num,raw$in_prev_holdout) %>% prop.table(1)*100
+
+inputs$hint_ratio <- inputs$num_hints_accepted/inputs$num_hints_decided
+inputs$hint_ratio[inputs$num_hints_decided==0] <- 0
+inputs$nodes_flag <- apply(X = inputs[,c("nodes_creation_flag","nodes_edit_flag")], MARGIN = 1, FUN = max, na.rm=T)
+inputs$in_prev_holdout <- factor(inputs$prev_holdout_group != "not in prev ho",levels = c("TRUE","FALSE"))
+
+table(inputs$active_this_week, inputs$in_session_summary_table) %>% prop.table()
+
+table(inputs$operating_system_name_code)
+
+inputs$os_group <- inputs$operating_system_name_code
+inputs$os_group[inputs$operating_system_name_code=="chromeos"] <- "chrome-os"
+inputs$os_group[inputs$operating_system_name_code=="freebsd" | inputs$operating_system_name_code=="kaios" | inputs$operating_system_name_code=="symbian"] <- "other"
+inputs$os_group[inputs$operating_system_name_code=="mac-os-x"] <- "macos"
+inputs$os_group[inputs$operating_system_name_code=="None"] <- "missing"
+inputs$os_group[is.na(inputs$operating_system_name_code)] <- "missing"
+table(inputs$os_group, inputs$device_group)
+
+inputs$leakage_events_no <- factor(inputs$leakage_events, levels =  c("no leakage events", "leakage events"))
+inputs$holdout_with_leakage <- as.numeric(inputs$holdout_group == "Holdout" & inputs$leakage_events == "leakage events")
+
+devices <- inputs[!is.na(inputs$device_group),] %>% 
+  group_by(ucdmid) %>% mutate(total_sessions = sum(device_count,na.rm = T)) %>% ungroup() %>%
+  group_by(ucdmid,device_group,os_group,n_device_groups, total_sessions) %>%
+  summarise(n_sessions_in_device = sum(device_count)) %>%
+  mutate(percent_sessions_in_device = 100 * n_sessions_in_device/total_sessions) %>% 
+  arrange(desc(n_sessions_in_device)) %>% ungroup() %>%
+  group_by(ucdmid) %>%
+  slice(1)
+  
+
+
+
+```
+
+```{r}
+culled <- raw[raw$date_diff <= 9 
+              & as.Date(raw$ufrdate) <= Sys.Date()-9 
+              & as.Date(raw$ufrdate) <= "2023-06-30"
+              & raw$email_type != "acomqa email" 
+              & raw$email_type != "ancestry email"
+              & raw$package_type != "PMT",] %>% 
+  left_join(devices, by = "ucdmid")
+max(culled$ufrdate)
+table(culled$leakage_events)
+culled$leakage_events_no <- factor(culled$leakage_events, levels =  c("no leakage events", "leakage events"))
+culled$holdout_with_leakage <- as.numeric(culled$holdout_group == "Holdout" & culled$leakage_events == "leakage events")
+culled$nonholdout <- factor(culled$holdout_group, levels = c("Non-Holdout","Holdout"))
+
+```
+
+
+
+
+
+```{r fig.height=5, fig.width=10}
+colnames(culled)
+table(culled$leakage_events, culled$holdout_group) %>% prop.table(2)
+hist(culled$prop_days_in_dau_table)
+hist(culled$prop_days_in_ss_table)
+
+quantile(culled$prop_days_in_dau_table, seq(0,1,.005))
+hist(log(culled[culled$in_dau_table_this_tenure==1,"prop_days_in_dau_table"]+1))
+
+culled %>% 
+  ggplot(aes(x=age, y=renewal_flag)) + 
+  annotate("rect", xmin = .7, xmax = .95, ymin = -Inf, ymax = Inf,  fill = "gray50", alpha=.1) +
+  stat_smooth(aes(x=age, y=renewal_flag),
+              method="gam",alpha = .2, linewidth=.5)+
+  scale_x_continuous(n.breaks = 20, name = "age") +
+  scale_y_continuous(n.breaks = 10, name = "Retention rate") +
+  theme_bw(base_size = 12)
+
+culled[culled$in_ss_table_this_tenure==1,] %>% 
+  ggplot(aes(x=(prop_days_in_ss_table), y=renewal_flag)) + 
+  stat_smooth(aes(x=(prop_days_in_ss_table), y=renewal_flag, color = factor(holdout_group), fill = factor(holdout_group)),
+              method="gam",alpha = .2, linewidth=.5)+
+  scale_x_continuous(n.breaks = 20, name = "(prop_days_in_ss_table)", limits = c(0,1)) +
+  scale_y_continuous(n.breaks = 10, name = "Retention rate") +
+  theme_classic(base_size = 10) + 
+  theme(legend.position = "bottom")
+culled %>% 
+  ggplot(aes(x=min_lifetimetenureid, y=renewal_flag)) + 
+  stat_smooth(aes(x=min_lifetimetenureid, y=renewal_flag, color = holdout_group, fill = holdout_group),
+              method="gam",alpha = .1, linewidth=.5)+
+  scale_x_continuous(n.breaks = 20, name = "min_lifetimetenureid") +
+  scale_y_continuous(n.breaks = 10, name = "Retention rate") +
+  theme_classic(base_size = 10)
+
+culled[culled$in_dau_table_this_tenure==1 & !is.na(culled$percent_sessions_in_device),] %>% 
+  ggplot(aes(x=(percent_sessions_in_device), y=renewal_flag)) + 
+  stat_smooth(aes(x=(percent_sessions_in_device), y=renewal_flag, color = holdout_group, fill = holdout_group),
+              method="gam",alpha = .2, linewidth=.5)+
+  #scale_x_continuous(n.breaks = 20, name = "percent_sessions_in_device", limits = c(0,1)) +
+  scale_y_continuous(n.breaks = 10, name = "Retention rate") +
+  facet_wrap(facets = "device_group") +
+  theme_classic(base_size = 10) + 
+  theme(legend.position = "bottom")
+```
+
+```{r fig.height=4, fig.width=7}
+culled %>% 
+  ggplot(aes(x=(prop_days_in_dau_table), y=renewal_flag)) + 
+  stat_smooth(aes(x=(prop_days_in_dau_table), y=renewal_flag, color = factor(holdout_group), fill = factor(holdout_group)),
+              method="gam",alpha = .2, linewidth=.5)+
+  scale_x_continuous(n.breaks = 20, name = "(prop_days_in_dau_table)", limits = c(0,1)) +
+  scale_y_continuous(n.breaks = 10, name = "Retention rate") +
+  facet_wrap(facets = "leakage_events") +
+  theme_classic(base_size = 10) + 
+  theme(legend.position = "bottom")
+
+summary(lm(prop_days_in_dau_table ~ leakage_events*holdout_group, culled[culled$in_dau_table_this_tenure == 1,]))
+
+culled %>% 
+  filter(in_dau_table_this_tenure == 1) %>% 
+  group_by(holdout_group, leakage_events) %>% 
+  summarise(mean_proportion_days_active = mean(prop_days_in_dau_table, na.rm = T)) %>%
+  ggplot(aes(x = holdout_group, y = mean_proportion_days_active, fill = leakage_events, label = leakage_events)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(mean_proportion_days_active,2)),
+            position = position_dodge2(width = .9, preserve = "single"), vjust = -.5, size = 4) +
+  theme_classic(base_size = 14)
+
+culled %>%
+  group_by(holdout_group,leakage_events) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,leakage_events,device_group, n_cell) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = device_group, y = percent, fill = leakage_events, label = leakage_events)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 2) +
+  scale_y_continuous(n.breaks = 12) + 
+  #coord_cartesian(ylim = c(45,80)) +
+  facet_wrap(facets = c("holdout_group")) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 9) + 
+  theme(legend.position = "bottom")
+```
+
+
+```{r fig.height=6, fig.width=10}
+
+agg_week <- culled %>%
+  filter() %>% 
+  mutate(ufrweek = as.Date(floor_date(ufrdate,unit = "week"))) %>%
+  group_by(ufrweek, holdout_group) %>% 
+  summarise(n_ufr = n_distinct(ucdmid),
+            n_renewals = sum(renewal_flag),.groups = "rowwise") %>%
+  mutate(renewal_rate = n_renewals/ n_ufr)
+
+agg_week %>%
+  ggplot() + 
+  geom_line(aes(x = ufrweek, y = renewal_rate,color = holdout_group),
+            linewidth = .5) +
+  geom_point(aes(x = ufrweek, y = renewal_rate,color = holdout_group),
+            size = .5) +
+  scale_x_date(date_labels = "%m/%d/%y", 
+               breaks = "1 week") +
+  scale_y_continuous(n.breaks = 12) +
+  coord_cartesian(ylim = c(.6,.8)) +
+  ggtitle(label = "Retention rate") +
+  theme_light(base_size = 12) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, size = 8))
+plogis(0.443733+0.020430) - plogis(0.443733)
+culled %>%
+  mutate(ufrweek = as.Date(floor_date(ufrdate,unit = "week"))) %>%
+  group_by(ufrweek, holdout_group, duration) %>% 
+  summarise(n_ufr = n_distinct(ucdmid),
+            n_renewals = sum(renewal_flag),.groups = "rowwise") %>%
+  mutate(renewal_rate = n_renewals/ n_ufr) %>%
+  ggplot() + 
+  geom_line(aes(x = ufrweek, y = renewal_rate,color = holdout_group),linewidth = .5) +
+  geom_point(aes(x = ufrweek, y = renewal_rate,color = holdout_group),size = .5) +
+  scale_x_date(date_labels = "%m/%d/%y", breaks = "1 week") +
+  scale_y_continuous(n.breaks = 12) +
+  facet_wrap(facets = "duration", scales = "free_y") +
+  #coord_cartesian(ylim = c(.5,1)) +
+  ggtitle(label = "Retention rate") +
+  theme_light(base_size = 12) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, size = 8), 
+        legend.text = element_text(size = 4), legend.title = element_text(size = 4))
+
+culled %>%
+  mutate(ufrweek = as.Date(floor_date(ufrdate,unit = "week"))) %>%
+  group_by(ufrweek, holdout_group, package_type) %>% 
+  summarise(n_ufr = n_distinct(ucdmid),
+            n_renewals = sum(renewal_flag),.groups = "rowwise") %>%
+  mutate(renewal_rate = n_renewals/ n_ufr) %>%
+  ggplot() + 
+  geom_line(aes(x = ufrweek, y = renewal_rate,color = holdout_group),linewidth = .5) +
+  geom_point(aes(x = ufrweek, y = renewal_rate,color = holdout_group),size = .5) +
+  scale_x_date(date_labels = "%m/%d/%y", breaks = "1 week") +
+  scale_y_continuous(n.breaks = 12) +
+ # coord_cartesian(ylim = c(.5,1)) +
+  facet_wrap(facets = "package_type", scales = "free_y") +
+  ggtitle(label = "Retention rate") +
+  theme_light(base_size = 10) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, size = 8), 
+        legend.text = element_text(size = 4), legend.title = element_text(size = 4))
+
+culled %>%
+  mutate(ufrweek = as.Date(floor_date(ufrdate,unit = "week"))) %>%
+  group_by(ufrweek, holdout_group, device_group) %>% 
+  summarise(n_ufr = n_distinct(ucdmid),
+            n_renewals = sum(renewal_flag),.groups = "rowwise") %>%
+  mutate(renewal_rate = n_renewals/ n_ufr) %>%
+  ggplot() + 
+  geom_line(aes(x = ufrweek, y = renewal_rate,color = holdout_group),linewidth = .5) +
+  geom_point(aes(x = ufrweek, y = renewal_rate,color = holdout_group),size = .5) +
+  scale_x_date(date_labels = "%m/%d/%y", breaks = "1 week") +
+  scale_y_continuous(n.breaks = 12) +
+ # coord_cartesian(ylim = c(.5,1)) +
+  facet_wrap(facets = "device_group", scales = "free_y") +
+  ggtitle(label = "Retention rate") +
+  theme_light(base_size = 10) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, size = 8), 
+        legend.text = element_text(size = 4), legend.title = element_text(size = 4))
+
+culled %>%
+  mutate(ufrweek = as.Date(floor_date(ufrdate,unit = "week"))) %>%
+  group_by(ufrweek, holdout_group, duration) %>% 
+  summarise(n_ufr = n_distinct(ucdmid),
+            n_renewals = sum(renewal_flag),.groups = "rowwise") %>%
+  mutate(renewal_rate = n_renewals/ n_ufr) %>%
+  ggplot() + 
+  geom_line(aes(x = ufrweek, y = n_ufr,color = holdout_group),linewidth = .5) +
+  geom_line(aes(x = ufrweek, y = n_renewals,color = holdout_group),linewidth = .5, linetype = 2) +
+  geom_point(aes(x = ufrweek, y = n_ufr,color = holdout_group),size = .5) +
+  scale_x_date(date_labels = "%m/%d/%y", breaks = "1 week") +
+  scale_y_continuous(n.breaks = 12) +
+ # coord_cartesian(ylim = c(.5,1)) +
+  facet_wrap(facets = "duration", scales = "free_y") +
+  ggtitle(label = "Retention rate") +
+  theme_light(base_size = 10) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, size = 8), 
+        legend.text = element_text(size = 4), legend.title = element_text(size = 4))
+
+culled %>%
+  mutate(ufrweek = as.Date(floor_date(ufrdate,unit = "week"))) %>%
+  group_by(ufrweek, holdout_group, leakage_events) %>% 
+  summarise(n_ufr = n_distinct(ucdmid),
+            n_renewals = sum(renewal_flag),.groups = "rowwise") %>%
+  mutate(renewal_rate = n_renewals/ n_ufr) %>%
+  ggplot() + 
+  geom_line(aes(x = ufrweek, y = renewal_rate,color = holdout_group),linewidth = .5) +
+  geom_point(aes(x = ufrweek, y = renewal_rate,color = holdout_group,size = n_ufr)) +
+  scale_x_date(date_labels = "%m/%d/%y", breaks = "1 week") +
+  scale_y_continuous(n.breaks = 12) +
+ # coord_cartesian(ylim = c(.5,1)) +
+  facet_wrap(facets = "leakage_events", scales = "free_y") +
+  ggtitle(label = "Retention rate") +
+  theme_light(base_size = 10) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, size = 8), 
+        legend.text = element_text(size = 4), legend.title = element_text(size = 4))
+```
+
+```{r fig.height=8, fig.width=10}
+culled %>%
+  #filter(!is.na(device_group)) %>% 
+  mutate(ufrweek = as.Date(floor_date(ufrdate,unit = "week"))) %>%
+  group_by(ufrweek, holdout_group, os_group) %>% 
+  summarise(n_ufr = n_distinct(ucdmid),
+            n_renewals = sum(renewal_flag),.groups = "rowwise") %>%
+  mutate(renewal_rate = n_renewals/ n_ufr) %>%
+  ggplot() + 
+  geom_line(aes(x = ufrweek, y = renewal_rate,color = (holdout_group)),
+            linewidth = .5) +
+  geom_point(aes(x = ufrweek, y = renewal_rate,color = holdout_group, size = n_ufr/2)) +
+  scale_x_date(date_labels = "%m/%d/%y", 
+               breaks = "1 week") +
+  scale_y_continuous(n.breaks = 12) +
+  #coord_cartesian(ylim = c(.5,1)) +
+  ggtitle(label = "Retention rate") +
+  facet_wrap(facets = "os_group", scales = "free_y") +
+  theme_light(base_size = 12) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, size = 8), 
+        legend.text = element_text(size = 4), legend.title = element_text(size = 4))
+```
+
+```{r}
+sum(!duplicated(culled$ucdmid))
+table(culled$duration[culled$in_dau_table_this_tenure==T]) %>% prop.table()
+table(culled$in_dau_table_this_tenure)
+
+raw$duration_monthly <- relevel(factor(raw$duration), ref = "Monthly")
+culled$duration_monthly <- relevel(factor(culled$duration), ref = "Monthly")
+culled$duration_sabm <- relevel(factor(culled$duration), ref = "Half Year Billed Monthly")
+culled$duration_semi <- relevel(factor(culled$duration), ref = "Half Year")
+culled$duration_ann <- relevel(factor(culled$duration), ref = "Annual")
+culled$duration_abm <- relevel(factor(culled$duration), ref = "Annual Billed Monthly")
+culled$duration_quar <- relevel(factor(culled$duration), ref = "Quarterly")
+culled$package_world <- relevel(factor(culled$package_type), ref = "World Deluxe")
+culled$package_country <- relevel(factor(culled$package_type), ref = "Country Deluxe")
+culled$package_family <- relevel(factor(culled$package_type), ref = "Family Plan")
+culled$week_number <- week(culled$ufrdate)
+culled$week_number_c <- culled$week_number-mean(culled$week_number)
+culled$device_group_detail <- NA
+culled$device_group_detail[culled$n_device_groups==1 & !is.na(culled$n_device_groups)] <- paste0(culled$device_group[culled$n_device_groups==1 & !is.na(culled$n_device_groups)], " only")
+culled$device_group_detail[culled$n_device_groups>1 & !is.na(culled$n_device_groups)] <- paste0(culled$device_group[culled$n_device_groups>1 & !is.na(culled$n_device_groups)], " mainly")
+table(culled$device_group_detail) %>% prop.table()*100
+
+culled_duplicated <- culled[culled$ucdmid %in% unique(culled$ucdmid[which(duplicated(culled$ucdmid))]),]
+culled_notduplicated <- culled[culled$ucdmid %notin% unique(culled$ucdmid[which(duplicated(culled$ucdmid))]),]
+```
+
+```{r}
+summary(glm(renewal_flag ~ holdout_group + leakage_events, family = "binomial", 
+            data = culled))
+summary(glm(renewal_flag ~ holdout_group + prop_days_in_dau_table, family = "binomial", 
+            data = culled[culled$in_dau_table_this_tenure == 1 & culled$holdout_with_leakage == 0,]))
+summary(glm(renewal_flag ~ holdout_group, family = "binomial", 
+            data = culled[culled$in_dau_table_this_tenure == 1 & culled$leakage_events == "leakage events",]))
+
+summary(glm(renewal_flag ~ holdout_group + prop_days_in_dau_table + holdout_with_leakage
+            , family = "binomial", 
+            data = culled[culled$in_dau_table_this_tenure == 1 & 
+                            culled$ufrdate >= as.Date("2023-01-01") & 
+                            culled$ufrdate <= as.Date("2023-01-31"),]))
+summary(glm(renewal_flag ~ holdout_group + prop_days_in_dau_table + holdout_with_leakage
+            , family = "binomial", 
+            data = culled[culled$in_dau_table_this_tenure == 1 & 
+                            culled$ufrdate >= as.Date("2023-06-01") & 
+                            culled$ufrdate <= as.Date("2023-06-19"),]))
+
+
+summary(glm(renewal_flag ~ holdout_group, family = "binomial", 
+            data = culled[culled$in_ss_table_this_tenure == 1,]))
+
+summary(glm(renewal_flag ~ holdout_group, family = "binomial", 
+            data = culled_notduplicated[culled_notduplicated$in_dau_table_this_tenure == 1,]))
+summary(glm(renewal_flag ~ holdout_group, family = "binomial", 
+            data = culled_duplicated[culled_duplicated$in_dau_table_this_tenure == 1,]))
+summary(glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", nAGQ = 1,
+            data = culled_duplicated[culled_duplicated$in_dau_table_this_tenure == 1,]))
+
+
+summary(glm(renewal_flag ~ holdout_group*package_world, family = "binomial", data = culled[culled$in_dau_table_this_tenure==1,]))
+summary(glm(renewal_flag ~ holdout_group, family = "binomial", data = culled[culled$in_dau_table_this_tenure==1 & culled$duration=="Monthly",]))
+
+summary(glm(renewal_flag ~ holdout_group, family = "binomial", data = culled[culled$in_dau_table_this_tenure==1,]))
+
+
+anova(glm(renewal_flag ~ holdout_group+duration, family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,]),
+      glm(renewal_flag ~ holdout_group*duration, family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,]), 
+      test = "LRT")
+
+summary(glm(renewal_flag ~ holdout_group*duration_monthly, family = "binomial", data = culled))
+summary(glm(renewal_flag ~ holdout_group*duration_sabm, family = "binomial", data = culled))
+summary(glm(renewal_flag ~ holdout_group*duration_semi, family = "binomial", data = culled))
+
+summary(glm(renewal_flag ~ holdout_group+age, family = "binomial", data = culled))
+summary(glm(renewal_flag ~ holdout_group+device_group, family = "binomial", data = culled))
+
+
+summary(lm(age ~ holdout_group, data = culled[culled$in_dau_table_this_tenure == 1,]))
+```
+
+Optimizers: 
+* Nelder_Mead 
+* bobyqa
+* nlminbwrap (gives higher p-values relative to above 2)
+* nmkbw (requires packages optimx and dfoptim) (doesn't take the maxfun argument inside the optCtrl parameter)
+* nloptwrap.NLOPT_LN_NELDERMEAD
+```{r}
+table(culled$in_dau_table_this_tenure)
+
+summary(glmer(renewal_flag ~ (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,], nAGQ = 1))
+
+summary(glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 & culled$holdout_with_leakage == 0,], nAGQ = 0))
+
+summary(glmer(renewal_flag ~ holdout_group  + holdout_with_leakage + prop_days_in_dau_table + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 ,], nAGQ = 1))
+
+summary(glmer(renewal_flag ~ holdout_group  + holdout_with_leakage  + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 ,], nAGQ = 1))
+
+summary(glmer(renewal_flag ~ holdout_group * tvalue_num + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 ,], nAGQ = 0))
+
+summary(glmer(renewal_flag ~ holdout_group * duration + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,], nAGQ = 0))
+
+base_glmer <- glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,], nAGQ = 1)
+
+base_summary <- summary(base_glmer)
+base_summary
+rr_may30 <- rr_mlm(raw, nAGQ = 1, optimizer = "Nelder_Mead")
+
+rr_mlm(raw[raw$ufrdate <= as.Date("2023-07-13")-9,], nAGQ = 1, optimizer = "Nelder_Mead")
+rr_mlm(culled_duplicated, nAGQ = 1)
+
+summary(glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", nAGQ = 1,
+              control=glmerControl(optimizer="Nelder_Mead", 
+                                   optCtrl=list(maxfun=2e6), #for bobyqa and Nelder_Mead
+                                   #optCtrl=list(maxfeval = 2e6), #for nmkbw
+                                   #tolPwrss = 1e-11,
+                                   check.scaleX = "message+rescale"),
+              data = (raw[raw$tvalue_num < 4 &
+                              raw$date_diff <= 9 
+                             & raw$netufrquantity == 1 
+                             & raw$in_dau_table_this_tenure==1 
+                             & raw$ufrdate <= Sys.Date()-9
+                             #& raw$email_type != "acomqa email"
+                             #& raw$package_type != "PMT"
+                             ,])))
+
+summary(glmer(renewal_flag ~ holdout_group  + (1|ucdmid), family = "binomial", data = culled, nAGQ = 0))
+
+summary(glmer(renewal_flag ~ holdout_group + prop_days_in_dau_table  + (1|ucdmid), family = "binomial", data = culled, nAGQ = 0))
+
+summary(glmer(renewal_flag ~ holdout_group * prop_days_in_dau_table + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,], nAGQ = 0))
+
+summary(glmer(renewal_flag ~ holdout_group * prop_days_in_ss_table + (1|ucdmid), family = "binomial", data = culled, nAGQ = 0))
+
+summary(glmer(renewal_flag ~ holdout_group  + (1 |ucdmid) , family = "binomial", 
+              control = glmerControl(optimizer="bobyqa", optCtrl = list(maxfun = 2e5)),
+              data = culled_duplicated[culled_duplicated$in_dau_table_this_tenure == 1,]))
+
+allFit(glmer(renewal_flag ~ holdout_group  + (1 |ucdmid) , family = "binomial",data = culled[culled$in_dau_table_this_tenure == 1,]))
+
+base_confint <- confint.merMod(base_glmer, method = "profile")
+base_confint
+base_confint_wald <- confint.merMod(base_glmer, method = "Wald")
+(plogis(base_confint_wald[2,1] + base_confint_wald[3,1]) - plogis(base_confint_wald[2,1]))*10000
+(plogis(base_confint_wald[2,2] + base_confint_wald[3,2]) - plogis(base_confint_wald[2,2]))*10000
+
+confint.merMod(glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 & culled$ufrdate <= '2023-04-22',], nAGQ = 1), method = "Wald")
+
+#tab_model(base_glmer,show.ci = T)
+
+rrweek_glmer <- glmer(renewal_flag ~ holdout_group + week_number_c + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,],nAGQ = 1)
+summary(rrweek_glmer)
+
+rrdur_glmer0 <- glmer(renewal_flag ~ holdout_group + duration_monthly + holdout_with_leakage+ (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,],nAGQ = 0)
+summary(rrdur_glmer0)
+rrdur_glmer <- glmer(renewal_flag ~ holdout_group * duration_monthly + holdout_with_leakage+ (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,],nAGQ = 0)
+summary(rrdur_glmer)
+
+anova(rrdur_glmer0, rrdur_glmer, test = "LRT")
+
+
+
+rrdev_glmer <- glmer(renewal_flag ~ holdout_group * device_group + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,],nAGQ = 0)
+summary(rrdev_glmer)
+summary(glmer(renewal_flag ~ holdout_group * device_group * percent_sessions_in_device + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,],nAGQ = 0))
+summary(glmer(renewal_flag ~ holdout_group + device_group_detail + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1,],nAGQ = 0))
+
+
+rrpkg_glmer0 <- glmer(renewal_flag ~ holdout_group + package_type + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 & culled$package_type != "PMT",],nAGQ = 0)
+summary(rrpkg_glmer0)
+rrpkg_glmer <- glmer(renewal_flag ~ holdout_group * package_country + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 & culled$package_type != "PMT",],nAGQ = 0)
+summary(rrpkg_glmer)
+anova(rrpkg_glmer0, rrpkg_glmer, test = "LRT")
+summary(glmer(renewal_flag ~ holdout_group * package_world + (1|ucdmid), family = "binomial", data = culled[culled$in_ss_table_this_tenure == 1 & culled$package_type != "PMT",],nAGQ = 0))
+
+```
+
+```{r}
+desktop_only <- culled[culled$in_dau_table_this_tenure==1 & culled$email_type != "acomqa email" & culled$device_group == "Desktop Web" & culled$percent_sessions_in_device >= 95
+                       ,]
+
+summary(glmer(renewal_flag ~ holdout_group + total_sessions + (1|ucdmid), family = "binomial", data = desktop_only, nAGQ = 1))
+summary(glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = culled[culled$device_group_detail == "Desktop Web only",], nAGQ = 1))
+summary(glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = culled[culled$device_group_detail == "Mobile App only",], nAGQ = 1))
+summary(glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = culled[culled$device_group_detail == "Mobile Web only",], nAGQ = 1))
+
+summary(glmer(renewal_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = culled[culled$device_group == "Desktop Web",], nAGQ = 1))
+```
+
+```{r}
+summary(glm(renewal_flag ~ holdout_group*package_type, data = culled, family = "binomial"))
+culled$package_type <- as.factor(culled$package_type)
+
+# plot interaction effect with t-value on x axis
+X1_range <- seq(from=min(culled$tvalue_num), to=max(culled$tvalue_num), by=1)
+
+X2_ho <- "Holdout" 
+X2_nho <- "Non-Holdout"
+generated_data <- as.data.frame(expand.grid(tvalue_num=X1_range, 
+                                            holdout_group=c(X2_ho, X2_nho)))
+generated_data$prob <- predict(glm(renewal_flag ~ holdout_group*tvalue_num, data = culled, family = "binomial"), newdata=generated_data, type = 'response')
+generated_data$age_c <- factor(generated_data$holdout_group, labels=c("Holdout", "Non-Holdout"), ordered = F)
+
+summary(glm(renewal_flag ~ in_ss_table_this_tenure*package_world, data = culled, family = "binomial"))
+table(culled$renewal_flag[culled$in_ss_table_this_tenure==0 & culled$package_type == "World Deluxe"]) %>% prop.table()
+table(culled$renewal_flag[culled$package_type == "World Deluxe"], culled$in_ss_table_this_tenure[culled$package_type == "World Deluxe"]) %>% prop.table(2)
+
+```
+
+
+
+```{r}
+sim_slopes(model = glm(renewal_flag ~ holdout_group*package_type + tvalue_num, data = culled, family = "binomial"),
+           pred = "holdout_group", modx = "package_type" , jnplot = F, 
+           confint = T, digits = 6, cond.int = T, centered = "none")
+
+```
+
+```{r }
+
+ggplot(generated_data, aes(x=tvalue_num, y=prob, color=holdout_group)) + 
+  geom_line(lwd=1) + 
+  scale_y_continuous(n.breaks = 15)+
+  labs(x="X1", y="P(renewal)") +
+  theme_minimal(base_size = 12)
+
+
+```
+
+
+```{r fig.height=4, fig.width=4}
+culled[culled$in_dau_table_this_tenure==T,] %>%
+  group_by(holdout_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,renewal_flag, n_cell) %>%
+  filter(renewal_flag == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = renewal_flag, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 3),color = "gray50", width = 1.6) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = 3, preserve = "single"), vjust = -.5, size = 7) +
+  ylab("Retention Rate") +
+  scale_x_discrete(name = "Holdout group") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(60,70)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 18) + 
+  theme(legend.position = "none")
+
+#table(culled$holdout_group[culled$in_dau_table_this_tenure==T]) 
+
+culled[culled$in_ss_table_this_tenure==T,] %>%
+  group_by(holdout_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,renewal_flag, n_cell) %>%
+  filter(renewal_flag == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = renewal_flag, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 3),color = "gray50", width = 1.6) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = 3, preserve = "single"), vjust = -.5, size = 7) +
+  ylab("Retention Rate") +
+  scale_x_discrete(name = "Holdout group") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(60,70)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 18) + 
+  theme(legend.position = "none")
+```
+
+```{r fig.height=4, fig.width=6}
+culled[culled$in_dau_table_this_tenure==T,] %>%
+  group_by(holdout_group,duration) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group, duration,renewal_flag, n_cell) %>%
+  filter(renewal_flag == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = duration, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(),color = "gray50") +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = 1, preserve = "single"), vjust = -.5, size = 4) +
+  ylab("Subscription-based retention rate") +
+  scale_x_discrete(name = "Subscription duration") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(40,95)) +
+  scale_fill_brewer(palette = 2) +
+  theme_classic(base_size = 10) + 
+  theme(legend.position = "bottom")
+
+culled[culled$in_dau_table_this_tenure==T,] %>%
+  group_by(holdout_group,device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,device_group,renewal_flag, n_cell) %>%
+  filter(renewal_flag == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(),color = "gray50") +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = 1, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Subscription-based retention rate") +
+  scale_x_discrete(name = "Subscription duration") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(40,100)) +
+  scale_fill_brewer(palette = 2) +
+  theme_classic(base_size = 12) + 
+  theme(legend.position = "bottom")
+
+culled[culled$in_dau_table_this_tenure==T,] %>%
+  group_by(holdout_group,device_group_detail) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,device_group_detail,renewal_flag, n_cell) %>%
+  filter(renewal_flag == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = device_group_detail, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(),color = "gray50") +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = 1, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Subscription-based retention rate") +
+  scale_x_discrete(name = "Subscription duration") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(40,100)) +
+  scale_fill_brewer(palette = 2) +
+  theme_classic(base_size = 9) + 
+  theme(legend.position = "bottom")
+```
+
+
+# Frequencies of input KPIs over time
+```{r fig.height=6, fig.width=9}
+
+inputs$in_ss_table_this_week_fctr[inputs$in_session_summary_table==1] <- "in ss table"
+inputs$in_ss_table_this_week_fctr[inputs$in_session_summary_table==0] <- "not in ss table"
+inputs$device_group_detail <- NA
+inputs$device_group_detail[inputs$n_device_groups==1 & !is.na(inputs$n_device_groups)] <- paste0(inputs$device_group[inputs$n_device_groups==1 & !is.na(inputs$n_device_groups)], " only")
+inputs$device_group_detail[inputs$n_device_groups>1 & !is.na(inputs$n_device_groups)] <- paste0(inputs$device_group[inputs$n_device_groups>1 & !is.na(inputs$n_device_groups)], " mainly")
+
+
+
+table(inputs$active_this_week,inputs$in_ss_table_this_week_fctr)
+table(inputs$device_group_detail) %>% prop.table()
+colnames(inputs)
+
+inputs$sum_in_dau_table_scaled <- std(log(inputs$sum_in_dau_table + 1))
+inputs$num_searches_scaled <- std(log(inputs$num_searches + 1))
+inputs$num_search_successes_scaled <- std(log(inputs$num_search_successes + 1))
+inputs$num_hints_reviewed_scaled <- std(log(inputs$num_hints_reviewed + 1))
+inputs$num_hints_decided_scaled <- std(log(inputs$num_hints_decided + 1))
+inputs$num_hints_accepted_scaled <- std(log(inputs$num_hints_accepted + 1))
+inputs$num_images_uploaded_scaled <- std(log(inputs$num_images_uploaded + 1))
+inputs$num_images_viewed_scaled <- std(log(inputs$num_images_viewed + 1))
+inputs$num_nodes_created_scaled <- std(log(inputs$num_nodes_created + 1))
+inputs$num_nodes_edited_scaled <- std(log(inputs$num_nodes_edited + 1))
+
+inputs_agg <- inputs %>% 
+  group_by(week,holdout_group,in_session_summary_table,in_ss_table_this_week_fctr,active_this_week) %>% 
+  summarise(n_users = n_distinct(ucdmid),
+            search_rate = sum(search_flag) / n_users,
+            search_click_rate = sum(search_click_flag)/ n_users,
+            search_success_rate = sum(search_success_flag)/ n_users,
+            node_edit_rate = sum(nodes_edit_flag)/ n_users,
+            node_creation_rate = sum(nodes_creation_flag)/ n_users,
+            hint_gen_rate = sum(hints_gen_flag)/ n_users,
+            hint_review_rate = sum(hints_reviewed_flag)/ n_users,
+            hint_interact_rate = sum(hints_interaction_flag)/ n_users,
+            hint_accept_rate = sum(hints_acceptance_flag)/ n_users,
+            mean_hint_ratio = mean(hint_ratio),
+            lihpnc_view_rate = sum(lihpnc_viewed_flag)/ n_users,
+            lihpnc_click_rate = sum(lihpnc_click_flag)/ sum(lihpnc_viewed_flag),
+            image_view_rate = sum(images_viewed_flag)/ n_users,
+            image_upload_rate = sum(images_uploaded_flag)/ n_users)
+
+
+ggplot(inputs_agg) + 
+  geom_line(aes(x = week, y = search_rate, color = holdout_group),linewidth = .5) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "Search Rate", n.breaks = 10) + 
+  scale_color_manual(values = c("black","firebrick")) +   scale_fill_manual(values = c("black","firebrick")) + 
+  facet_wrap(facets = c("in_ss_table_this_week_fctr","active_this_week")) + 
+  theme_classic(base_size = 6)
+ggplot(inputs_agg) + 
+  geom_line(aes(x = week, y = node_creation_rate, color = holdout_group),linewidth = .5) + 
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "Node Creation Rate", n.breaks = 10) + 
+  scale_color_manual(values = c("black","firebrick")) +   scale_fill_manual(values = c("black","firebrick")) + 
+  facet_wrap(facets = c("in_ss_table_this_week_fctr","active_this_week")) + 
+  theme_classic()
+ggplot(inputs_agg) + 
+  geom_line(aes(x = week, y = node_edit_rate, color = holdout_group),linewidth = .5) + 
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "Node Edit Rate", n.breaks = 10) + 
+  scale_color_manual(values = c("black","firebrick")) +   scale_fill_manual(values = c("black","firebrick")) + 
+  facet_wrap(facets = c("in_ss_table_this_week_fctr","active_this_week")) + 
+  theme_classic()
+ggplot(inputs_agg) + 
+  geom_line(aes(x = week, y = hint_gen_rate, color = holdout_group),linewidth = .5) + 
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "hint_gen_rate", n.breaks = 10) + 
+  scale_color_manual(values = c("black","firebrick")) +   scale_fill_manual(values = c("black","firebrick")) + 
+  facet_wrap(facets = c("in_ss_table_this_week_fctr","active_this_week")) + 
+  theme_classic()
+ggplot(inputs_agg) + 
+  geom_line(aes(x = week, y = hint_review_rate, color = holdout_group),linewidth = .5) + 
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "hint_review_rate") + 
+  scale_color_manual(values = c("black","firebrick")) +   scale_fill_manual(values = c("black","firebrick")) + 
+  facet_wrap(facets = c("in_ss_table_this_week_fctr","active_this_week")) + 
+  theme_classic()
+ggplot(inputs_agg) + 
+  geom_line(aes(x = week, y = hint_interact_rate, color = holdout_group),linewidth = .5) + 
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "hint_interact_rate") + 
+  scale_color_manual(values = c("black","firebrick")) +   scale_fill_manual(values = c("black","firebrick")) + 
+  facet_wrap(facets = c("in_ss_table_this_week_fctr","active_this_week")) + 
+  theme_classic()
+ggplot(inputs_agg) + 
+  geom_line(aes(x = week, y = image_view_rate, color = holdout_group),linewidth = .5) + 
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "image_view_rate", n.breaks = 10) + 
+  scale_color_manual(values = c("black","firebrick")) +   scale_fill_manual(values = c("black","firebrick")) + 
+  facet_wrap(facets = c("in_ss_table_this_week_fctr","active_this_week")) + 
+  theme_classic()
+ggplot(inputs_agg) + 
+  geom_line(aes(x = week, y = mean_hint_ratio, color = holdout_group),linewidth = .5) + 
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "User-Level Hint Acceptance Ratio") + 
+  scale_color_manual(values = c("black","firebrick")) +   scale_fill_manual(values = c("black","firebrick")) + 
+  facet_wrap(facets = c("in_ss_table_this_week_fctr","active_this_week")) + 
+  theme_classic()
+```
+
+
+```{r}
+ggplot(inputs[inputs$duration == "Monthly",], aes(x = num_hints_decided)) +
+  geom_histogram(aes(fill = holdout_group, color = holdout_group), 
+                      alpha = .4, size = .1, bins = 15000) +
+  #geom_density(aes(fill = holdout_group, color = holdout_group), 
+  #                    alpha = .4, size = .1) +
+  scale_color_manual(values = c("#00AFBB", "#E7B800", "#FC4E07")) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800", "#FC4E07")) +
+  coord_cartesian(xlim = c(0,100)) +
+  scale_y_continuous(n.breaks = 10, name = "Number of subscribers") +
+  scale_x_continuous(n.breaks = 10, name = "Number of hints decided") +
+  ggtitle("Histogram of number of hints decided per month", subtitle = "T1-T3 monthly subscribers") +
+  theme_classic() + 
+  theme(legend.position = "bottom")
+
+
+whichdist(inputs, "num_hints_decided")
+summary(glm.nb(num_hints_decided~holdout_group, data = inputs))
+summary(lm(num_hints_decided_scaled~holdout_group, data = inputs))
+summary(lmer(num_hints_decided_scaled ~ holdout_group + (1|ucdmid), data = inputs))
+```
+
+
+```{r}
+age_data <- inputs %>% select(ucdmid, holdout_group, age, num_hints_decided) %>% distinct() %>% sample_frac(size = .05)
+age_data$age[is.na(age_data$age)] <- 0
+
+ggplot(age_data, aes(x = age)) +
+  geom_histogram(aes(fill = holdout_group, color = holdout_group), 
+                      alpha = .4, size = .1, bins = 50) +
+  #geom_density(aes(fill = holdout_group, color = holdout_group), 
+  #                    alpha = .4, size = .1) +
+  scale_color_manual(values = c("#00AFBB", "#E7B800", "#FC4E07")) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800", "#FC4E07")) +
+  coord_cartesian(xlim = c(0,100)) +
+  scale_y_continuous(n.breaks = 10, name = "Number of subscribers") +
+  scale_x_continuous(n.breaks = 10, name = "Age") +
+  ggtitle("Histogram of subscriber age") +
+  theme_classic() + 
+  theme(legend.position = "bottom")
+
+
+quantile(inputs$num_hints_decided[inputs$holdout_group == "Holdout" & inputs$num_hints_decided>200], probs = seq(0,1,.05))
+quantile(inputs$num_hints_decided[inputs$holdout_group == "Non-Holdout" & inputs$num_hints_decided>200], probs = seq(0,1,.05))
+
+```
+
+
+```{r fig.height=4, fig.width=8}
+inputs_agg2 <- inputs %>% 
+  group_by(week,holdout_group,leakage_events) %>% 
+  summarise(n_users = n_distinct(ucdmid),
+            search_rate = sum(search_flag, na.rm = T) / n_users,
+            search_click_rate = sum(search_click_flag, na.rm = T)/ n_users,
+            search_success_rate = sum(search_success_flag, na.rm = T)/ n_users,
+            #node_rate = sum(nodes_flag, na.rm = T)/ n_users,
+            node_creation_rate = sum(nodes_creation_flag, na.rm = T)/ n_users,
+            node_edit_rate = sum(nodes_edit_flag, na.rm = T)/ n_users,
+            hint_gen_rate = sum(hints_gen_flag, na.rm = T)/ n_users,
+            hint_review_rate = sum(hints_reviewed_flag, na.rm = T)/ n_users,
+            hint_interact_rate = sum(hints_interaction_flag, na.rm = T)/ n_users,
+            hint_accept_rate = sum(hints_acceptance_flag, na.rm = T)/ n_users,
+            mean_hint_ratio = mean(hint_ratio, na.rm = T),
+            lihpnc_view_rate = sum(lihpnc_viewed_flag, na.rm = T)/ n_users,
+            lihpnc_click_rate = sum(lihpnc_click_flag, na.rm = T)/ sum(lihpnc_viewed_flag, na.rm = T),
+            image_view_rate = sum(images_viewed_flag, na.rm = T)/ n_users,
+            image_upload_rate = sum(images_uploaded_flag, na.rm = T)/ n_users)
+  
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = search_rate, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  #coord_cartesian(ylim = c(.35,.65)) +
+  scale_y_continuous(name = "Search Rate", n.breaks = 10) + 
+  theme_classic(base_size = 14) + 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = node_rate, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "Node Rate", n.breaks = 10) + 
+  #coord_cartesian(ylim = c(.3,.6)) +
+  theme_classic(base_size = 15)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = node_creation_rate, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "Node Creation Rate", n.breaks = 10) + 
+  #coord_cartesian(ylim = c(.3,.75)) +
+  theme_classic(base_size = 14)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = node_edit_rate, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "Node Edit Rate", n.breaks = 10) + 
+  #coord_cartesian(ylim = c(.3,.75)) +
+  theme_classic(base_size = 14)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = hint_gen_rate, color = interaction(holdout_group,leakage_events)),linewidth = .6) + 
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "hint_gen_rate", n.breaks = 10) + 
+  #coord_cartesian(ylim = c(.3,1)) +
+  theme_classic(base_size = 8)+ 
+  theme(legend.position = "right", legend.title=element_text(size=6), legend.text=element_text(size=5))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = hint_review_rate, color = interaction(holdout_group,leakage_events)),linewidth = .8) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "hint_review_rate") + 
+  #coord_cartesian(ylim = c(.3,1)) +
+  theme_classic(base_size = 14)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = hint_interact_rate, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "hint_interact_rate",n.breaks = 10) + 
+  #coord_cartesian(ylim = c(.3,1)) +
+  theme_classic(base_size = 14)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = hint_accept_rate, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "hint_accept_rate", n.breaks = 10) + 
+  #coord_cartesian(ylim = c(.3,1)) +
+  theme_classic(base_size = 14)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = image_view_rate, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "image_view_rate", n.breaks = 10) + 
+  #coord_cartesian(ylim = c(.3,1)) +
+  theme_classic(base_size = 14)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = image_upload_rate, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "Image upload rate", n.breaks = 10) + 
+  #coord_cartesian(ylim = c(.3,1)) +
+  theme_classic(base_size = 14)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+ggplot(inputs_agg2) + 
+  geom_line(aes(x = week, y = mean_hint_ratio, color = interaction(holdout_group,leakage_events)),linewidth = 1) + 
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d", name = "\nActivity Week")+
+  scale_y_continuous(name = "User-Level Hint Acceptance Ratio") + 
+ # coord_cartesian(ylim = c(.3,1)) +
+  theme_classic(base_size = 14)+ 
+  theme(legend.position = "right", legend.title=element_text(size=0), legend.text=element_text(size=10))
+```
+
+
+
+```{r}
+table(inputs$in_dau_table_this_week)
+colnames(inputs)
+inputs_alltime <- inputs %>% 
+  left_join(devices %>% rename(alltime_device_group=device_group), by = "ucdmid") %>% 
+  group_by(ucdmid,holdout_group, leakage_events, alltime_device_group, percent_sessions_in_device, total_sessions
+           ) %>%
+  summarise(ever_renewed = max(renewal_flag),
+            duration = first(duration),
+            age = min(age),
+            in_dau_table = max(active_this_week,na.rm = T),
+            in_ss_table = max(in_session_summary_table,na.rm = T),
+            max_search_flag = max(search_flag,na.rm = T),
+            total_searches = sum(num_searches,na.rm = T),
+            max_search_click = max(search_click_flag,na.rm = T),
+            max_search_success = max(search_success_flag,na.rm = T),
+            #max_nodes = max(nodes_flag,na.rm = T),
+            max_node_edit = max(nodes_edit_flag,na.rm = T),
+            total_nodes_edited = sum(num_nodes_edited,na.rm = T),
+            max_node_creation = max(nodes_creation_flag,na.rm = T),
+            max_hints_gen = max(hints_gen_flag,na.rm = T),
+            max_hints_review = max(hints_reviewed_flag,na.rm = T),
+            total_hints_reviewed = sum(num_hints_reviewed,na.rm = T),
+            total_images_uploaded = sum(num_images_uploaded,na.rm = T),
+            total_images_viewed = sum(num_images_viewed,na.rm = T),
+            max_hints_interact = max(hints_interaction_flag,na.rm = T),
+            max_hints_accept = max(hints_acceptance_flag,na.rm = T),
+            n_hints_decided = sum(num_hints_decided,na.rm = T),
+            n_hints_accepted = sum(num_hints_accepted,na.rm = T),
+            max_lihpnc_view = max(lihpnc_viewed_flag,na.rm = T),
+            max_lihpnc_click = max(lihpnc_click_flag,na.rm = T),
+            max_images_viewed = max(images_viewed_flag,na.rm = T),
+            max_images_uploaded = max(images_uploaded_flag,na.rm = T),
+            hint_ratio = n_hints_accepted/n_hints_decided) 
+inputs_alltime$holdout_bool <- inputs_alltime$holdout_group == "Holdout"
+
+inputs_alltime$duration_monthly <- relevel(factor(inputs_alltime$duration), ref = "Monthly")
+inputs_alltime$duration_sabm <- relevel(factor(inputs_alltime$duration), ref = "Half Year Billed Monthly")
+inputs_alltime$duration_semi <- relevel(factor(inputs_alltime$duration), ref = "Half Year")
+inputs_alltime$duration_ann <- relevel(factor(inputs_alltime$duration), ref = "Annual")
+inputs_alltime$duration_abm <- relevel(factor(inputs_alltime$duration), ref = "Annual Billed Monthly")
+inputs_alltime$duration_quar <- relevel(factor(inputs_alltime$duration), ref = "Quarterly")
+
+sum(duplicated(inputs_alltime$ucdmid)) / nrow(inputs_alltime)
+table(inputs_alltime$in_dau_table, inputs_alltime$holdout_group) %>% prop.table(1)
+table(inputs_alltime$in_ss_table, inputs_alltime$holdout_group) %>% prop.table(1)
+summary(glm(holdout_bool~in_dau_table, data = inputs_alltime, family = "binomial"))
+
+table(inputs_alltime$alltime_device_group, inputs_alltime$holdout_group) %>% prop.table(1)*100
+summary(glm(holdout_bool~alltime_device_group, data = inputs_alltime[inputs_alltime$in_dau_table == 1,], family = "binomial"))
+summary(glm(holdout_bool~ftm_user, data = inputs_alltime[inputs_alltime$in_dau_table == 1,], family = "binomial"))
+summary(glm(holdout_bool~in_prev_holdout, data = inputs_alltime[inputs_alltime$in_dau_table == 1,], family = "binomial"))
+summary(glm(holdout_bool~alltime_device_group*percent_sessions_in_device, data = inputs_alltime[inputs_alltime$in_dau_table == 1,], family = "binomial"))
+summary(glm(ever_renewed ~ holdout_group, data = inputs_alltime[inputs_alltime$in_dau_table == 1,], family = "binomial"))
+summary(lm(age ~ holdout_group, data = inputs_alltime[inputs_alltime$in_dau_table == 1,]))
+```
+
+```{r fig.height=4, fig.width=8}
+inputs_alltime %>% 
+  ggplot() + 
+  geom_histogram(aes(x = total_hints_reviewed, color = holdout_group, fill = holdout_group), alpha = .5, position = "dodge") + 
+  theme_classic()
+ggplot(inputs_alltime, aes(x = total_sessions, color = holdout_group, fill = holdout_group)) +
+  geom_density(size = .1,position = "dodge",
+               alpha = 0.5) +
+  scale_x_continuous(n.breaks = 10, limits = c(0,200)) +
+  scale_y_continuous(n.breaks = 10) +
+  scale_color_brewer(type = "qual", palette = 2) +
+  scale_fill_brewer(type = "qual", palette = 2) +
+  theme_classic()
+ggplot(inputs_alltime, aes(x = total_hints_reviewed, color = holdout_group, fill = holdout_group)) +
+  geom_density(size = .1,position = "dodge",
+               alpha = 0.5) +
+  scale_x_continuous(n.breaks = 10, limits = c(0,100)) +
+  scale_y_continuous(n.breaks = 10) +
+  scale_color_brewer(type = "qual", palette = 2) +
+  scale_fill_brewer(type = "qual", palette = 2) +
+  theme_classic()
+```
+
+```{r fig.height=4, fig.width=6}
+inputs_alltime %>%
+  group_by(holdout_group,alltime_device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,alltime_device_group,max_search_flag, n_cell) %>%
+  filter(max_search_flag == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = alltime_device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Search Rate") + xlab("Primary device type") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(45,80)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 13) + 
+  theme(legend.position = "bottom")
+inputs_alltime %>%
+  filter(!is.na(alltime_device_group)) %>%
+  group_by(holdout_group,alltime_device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,alltime_device_group,max_search_click, n_cell) %>%
+  filter(max_search_click == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = alltime_device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Search Click Rate") + xlab("Primary device type") +
+  scale_y_continuous(n.breaks = 12) + 
+  #coord_cartesian(ylim = c(15,80)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 13) + 
+  theme(legend.position = "bottom")
+
+summary(glm(max_search_flag ~ holdout_group, data = inputs_alltime[inputs_alltime$in_dau_table == 1, ], family = "binomial"))
+summary(glm(max_search_flag ~ holdout_group*in_prev_holdout, data = inputs_alltime, family = "binomial"))
+summary(glm(max_search_flag ~ holdout_group*in_dau_table, data = inputs_alltime, family = "binomial"))
+summary(glm(max_search_flag ~ holdout_group*in_ss_table, data = inputs_alltime, family = "binomial"))
+summary(glm(max_search_flag ~ holdout_group*duration_sabm, data = inputs_alltime[inputs_alltime$in_dau_table == 1, ], family = "binomial"))
+summary(glm(max_search_flag ~ holdout_group+alltime_device_group, data = inputs_alltime[inputs_alltime$in_dau_table == 1, ], family = "binomial"))
+summary(glm(max_search_flag ~ holdout_group+age, data = inputs_alltime[inputs_alltime$in_dau_table == 1, ], family = "binomial"))
+
+summary(glm(max_search_success ~ holdout_group+max_search_flag, data = inputs_alltime[inputs_alltime$in_dau_table == 1, ], family = "binomial"))
+
+```
+
+```{r}
+summary(glm(max_search_click ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_search_success ~ holdout_group, data = inputs_alltime, family = "binomial"))
+```
+
+```{r fig.height=4, fig.width=4}
+inputs_alltime %>%
+  filter(!is.na(alltime_device_group)) %>%
+  group_by(holdout_group,alltime_device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,alltime_device_group,max_node_edit, n_cell) %>%
+  filter(max_node_edit == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = alltime_device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Node Edit Rate") + xlab("Primary device type") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(45,80)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 13) + 
+  theme(legend.position = "bottom")
+
+summary(glm(max_nodes ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_node_edit ~ holdout_group, data = inputs_alltime[inputs_alltime$in_dau_table == 1 , ], family = "binomial"))
+summary(glm.nb(total_sessions ~ holdout_group, data = inputs_alltime[inputs_alltime$in_dau_table == 1 & inputs_alltime$total_sessions <2000, ]))
+summary(glm(max_node_edit ~ holdout_group*in_dau_table, data = inputs_alltime, family = "binomial"))
+summary(glm(max_node_edit ~ holdout_group*in_ss_table, data = inputs_alltime, family = "binomial"))
+summary(glm(max_node_edit ~ holdout_bool*alltime_device_group, data = inputs_alltime[inputs_alltime$in_dau_table == 1 & inputs_alltime$total_sessions <2000, ], family = "binomial"))
+summary(glm(max_node_edit ~ holdout_bool+alltime_device_group+total_sessions, data = inputs_alltime[inputs_alltime$in_dau_table == 1 & inputs_alltime$total_sessions <2000, ], family = "binomial"))
+summary(glm(max_node_edit ~ holdout_bool*ftm_user, data = inputs_alltime, family = "binomial"))
+
+```
+
+```{r fig.height=4, fig.width=4}
+inputs_alltime %>%
+  filter(!is.na(alltime_device_group)) %>%
+  group_by(holdout_group,alltime_device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,alltime_device_group,max_node_creation, n_cell) %>%
+  filter(max_node_creation == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = alltime_device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8, size = .3) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Node Creation Rate") + xlab("Primary device type") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(40,65)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 13) + 
+  theme(legend.position = "bottom")
+summary(glm(max_node_creation ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_node_creation ~ holdout_group*in_dau_table, data = inputs_alltime, family = "binomial"))
+summary(glm(max_node_creation ~ holdout_group*in_ss_table, data = inputs_alltime, family = "binomial"))
+summary(glm(max_node_creation ~ holdout_group*alltime_device_group, data = inputs_alltime, family = "binomial"))
+
+
+```
+
+```{r fig.height=4, fig.width=4}
+inputs_alltime %>%
+  filter(!is.na(alltime_device_group)) %>%
+  group_by(holdout_group,alltime_device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,alltime_device_group,max_hints_review, n_cell) %>%
+  filter(max_hints_review == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = alltime_device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8, size = .3) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Hint Review Rate") + xlab("Primary device type") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(50,80)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 13) + 
+  theme(legend.position = "bottom")
+summary(glm(max_hints_gen ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_hints_review ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_hints_review ~ holdout_group*in_dau_table, data = inputs_alltime, family = "binomial"))
+summary(glm(max_hints_review ~ holdout_group*in_ss_table, data = inputs_alltime, family = "binomial"))
+summary(glm(max_hints_review ~ holdout_group*alltime_device_group, data = inputs_alltime, family = "binomial"))
+summary(zeroinfl(total_hints_reviewed ~ holdout_group, data = inputs_alltime, dist = "negbin"))
+
+```
+
+```{r fig.height=4, fig.width=4}
+inputs_alltime %>%
+  filter(!is.na(alltime_device_group)) %>%
+  group_by(holdout_group,alltime_device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,alltime_device_group,max_hints_interact, n_cell) %>%
+  filter(max_hints_interact == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = alltime_device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8, size = .3) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Hint Decision Rate") + xlab("Primary device type") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(40,70)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 13) + 
+  theme(legend.position = "bottom")
+summary(glm(max_hints_interact ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_hints_interact ~ holdout_group*alltime_device_group, data = inputs_alltime, family = "binomial"))
+
+
+```
+
+```{r fig.height=4, fig.width=4}
+inputs_alltime %>%
+  filter(!is.na(alltime_device_group)) %>%
+  group_by(holdout_group,alltime_device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,alltime_device_group,max_hints_accept, n_cell) %>%
+  filter(max_hints_accept == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = alltime_device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8, size = .3) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Hint Acceptance Rate") + xlab("Primary device type") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(35,65)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 13) + 
+  theme(legend.position = "bottom")
+summary(glm(max_hints_accept ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_hints_accept ~ holdout_group*alltime_device_group, data = inputs_alltime, family = "binomial"))
+
+
+```
+
+
+```{r fig.height=4, fig.width=4}
+inputs_alltime %>%
+  filter(!is.na(alltime_device_group)) %>%
+  group_by(holdout_group,alltime_device_group) %>%
+  dplyr::mutate(n_cell = n()) %>%
+  group_by(holdout_group,alltime_device_group,max_images_viewed, n_cell) %>%
+  filter(max_images_viewed == 1) %>%
+  dplyr::summarise(n_convert = n(), .groups = "rowwise") %>%
+  mutate(percent = (n_convert / n_cell)*100) %>% 
+  ggplot(aes(x = alltime_device_group, y = percent, fill = holdout_group, label = holdout_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8, size = .3) +
+  geom_text(aes(label = round(percent,2)),
+            position = position_dodge2(width = .8, preserve = "single"), vjust = -.5, size = 3) +
+  ylab("Image View Rate") + xlab("Primary device type") +
+  scale_y_continuous(n.breaks = 12) + 
+  coord_cartesian(ylim = c(35,70)) +
+  scale_fill_manual(values = c("#bab0ad","#77b7b3")) +
+  theme_classic(base_size = 13) + 
+  theme(legend.position = "bottom")
+summary(glm(max_lihpnc_view ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_lihpnc_click ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_images_viewed ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(glm(max_images_viewed ~ holdout_group*alltime_device_group, data = inputs_alltime, family = "binomial"))
+
+summary(glm(max_images_uploaded ~ holdout_group, data = inputs_alltime, family = "binomial"))
+summary(lm(hint_ratio ~ holdout_group, data = inputs_alltime))
+summary(glm.nb(n_hints_accepted ~ holdout_group, data = inputs_alltime))
+```
+
+```{r fig.height=3, fig.width=8}
+
+culled <- culled %>% left_join(inputs_alltime, by = "ucdmid")
+
+colnames(culled)
+summary(glmer(renewal_flag ~ holdout_group.x + prop_days_in_dau_table + max_images_uploaded + max_search_success + max_node_edit+ (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 & culled$holdout_with_leakage == 0,], nAGQ = 0))
+
+summary(glmer(renewal_flag ~ holdout_group + prop_days_in_dau_table + leakage_events + (1|ucdmid), family = "binomial", data = culled[culled$in_dau_table_this_tenure == 1 ,], nAGQ = 0))
+
+
+```
+
+
+
+```{r}
+colnames(inputs)
+
+inputs$week_number <- week(inputs$week)
+inputs$week_number_c <- inputs$week_number-mean(inputs$week_number)
+```
+
+```{r}
+colnames(inputs)
+random_users <- sample(x = unique(inputs$ucdmid),size = 50000,replace = F)
+
+performance::icc(glmer(max_search_flag ~ (1|ucdmid), family = "binomial", 
+                       data = inputs[inputs$ucdmid %in% random_users,], nAGQ = 0))
+summ(glmer(max_search_flag ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), family = "binomial", 
+                       data = inputs[inputs$ucdmid %in% random_users,], nAGQ = 0))
+plot(allEffects(glmer(max_search_flag ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), family = "binomial", 
+                       data = inputs[inputs$ucdmid %in% random_users,], nAGQ = 0)))
+```
+
+```{r}
+inputs$device_group[is.na(inputs$device_group)] <- "Unknown"
+inputs$device_group <- factor(inputs$device_group, levels = c("Mobile App", "Mobile Web", "Desktop Web", "Unknown"))
+
+```
+
+## Logistic multi-level mixed effects models on input metrics: 
+
+### MLM search flag
+```{r}
+search_glmer_base <- glmer(search_flag ~ holdout_group + (1|ucdmid), family = "binomial", 
+                           data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+#search_glmer_ho <- glmer(search_flag ~ holdout_group*in_prev_holdout + (1|ucdmid), family = "binomial", data = inputs, nAGQ = 0)
+search_glmer_dev <- glmer(search_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+summary(search_glmer_base)
+#summary(search_glmer_ho)
+summary(search_glmer_dev)
+
+######## Search flag has a significant interaction effect with device group, but even within desktop users and within desktop-ONLY users, ho>nho.
+
+```
+
+
+### MLM search click flag
+```{r}
+search_click_glmer_base <- glmer(search_click_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$active_this_week==1 & inputs$holdout_with_leakage==0,], nAGQ = 0)
+#search_click_glmer_ho <- glmer(search_click_flag ~ holdout_group*in_prev_holdout + (1|ucdmid), family = "binomial", data = inputs, nAGQ = 0)
+search_click_glmer_dev <- glmer(search_click_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+
+summary(search_click_glmer_base)
+#summary(search_click_glmer_ho)
+summary(search_click_glmer_dev)
+
+# Desktop-only users?
+summary(glmer(search_click_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$device_group_detail == "Desktop Web only",], nAGQ = 0))
+
+######## Search click flag has a significant interaction effect with device group. Within desktop-only users, the difference is positive but not significant.
+
+```
+
+
+### MLM search success flag
+```{r}
+search_success_glmer_base <- glmer(search_success_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+#search_success_glmer_ho <- glmer(search_success_flag ~ holdout_group*in_prev_holdout + (1|ucdmid), family = "binomial", data = inputs, nAGQ = 0)
+search_success_glmer_dev <- glmer(search_success_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+summary(search_success_glmer_base)
+#summary(search_success_glmer_ho)
+summary(search_success_glmer_dev)
+
+# Desktop-only?
+summary(glmer(search_success_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$device_group_detail == "Desktop Web only",], nAGQ = 0))
+######## Search success flag has a significant interaction effect with device group. Within desktop-only users, the difference is also negative but not significant.
+
+```
+
+
+### MLM node modification flag
+```{r}
+nodes_glmer_base <- glmer(nodes_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+nodes_glmer_dev <- glmer(nodes_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+
+summary(nodes_glmer_base)
+summary(nodes_glmer_dev)
+
+#Desktop-only?
+summary(glmer(nodes_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$device_group_detail == "Desktop Web only",], nAGQ = 0))
+######## Nodes flag has a significant interaction effect with device group. Within desktop-only users, the difference is also negative and significant.
+
+```
+
+
+### MLM node creation
+```{r}
+nodes_creation_glmer_base <- glmer(nodes_creation_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+nodes_creation_glmer_dev <- glmer(nodes_creation_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+#nodes_glmer_ho <- glmer(nodes_flag ~ holdout_group*in_prev_holdout + (1|ucdmid), family = "binomial", data = inputs, nAGQ = 0)
+summary(nodes_creation_glmer_base)
+summary(nodes_creation_glmer_dev)
+lrtest(nodes_creation_glmer_base,nodes_creation_glmer_dev)
+
+#Desktop-only?
+summary(glmer(nodes_creation_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$device_group_detail == "Desktop Web only",], nAGQ = 0))
+######## Nodes creation has a significant interaction effect with device group. Within desktop-only users, the difference is also negative but NOT significant.
+
+```
+
+
+### MLM node edit
+```{r}
+nodes_edit_glmer_base <- glmer(nodes_edit_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+nodes_edit_glmer_dev <- glmer(nodes_edit_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+
+summary(nodes_edit_glmer_base)
+summary(nodes_edit_glmer_dev)
+
+#Desktop-only?
+summary(glmer(nodes_edit_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$device_group_detail == "Desktop Web only",], nAGQ = 0))
+######## Nodes edit has a significant interaction effect with device group. Within desktop-only users, the difference is also negative AND significant.
+```
+
+
+### MLM hint review
+```{r}
+hint_review_glmer_base <- glmer(hints_reviewed_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+#hint_review_glmer_ho <- glmer(hints_reviewed_flag ~ holdout_group*in_prev_holdout + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+hint_review_glmer_dev <- glmer(hints_reviewed_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+summary(hint_review_glmer_base)
+#summary(hint_review_glmer_ho)
+summary(hint_review_glmer_dev)
+```
+
+
+### MLM hint interaction
+```{r}
+hint_interact_glmer_base <- glmer(hints_interaction_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+#hint_interact_glmer_ho <- glmer(hints_interaction_flag ~ holdout_group*in_prev_holdout + (1|ucdmid), family = "binomial", data = inputs, nAGQ = 0)
+hint_interact_glmer_dev <- glmer(hints_interaction_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+
+summary(hint_interact_glmer_base)
+#summary(hint_interact_glmer_ho)
+summary(hint_interact_glmer_dev)
+```
+
+
+### MLM hint acceptance
+```{r}
+hint_accept_glmer_base <- glmer(hints_acceptance_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+#hint_accept_glmer_ho <- glmer(hints_acceptance_flag ~ holdout_group*in_prev_holdout + (1|ucdmid), family = "binomial", data = inputs, nAGQ = 0)
+hint_accept_glmer_dev <- glmer(hints_acceptance_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+
+summary(hint_accept_glmer_base)
+#summary(hint_accept_glmer_ho)
+summary(hint_accept_glmer_dev)
+```
+
+
+### MLM LIHP view
+```{r}
+lihpnc_view_glmer_base <- glmer(lihpnc_viewed_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+lihpnc_view_glmer_dev <- glmer(lihpnc_viewed_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+summary(lihpnc_view_glmer_base)
+summary(lihpnc_view_glmer_dev)
+```
+
+
+### MLM LIHP click
+```{r}
+lihpnc_click_glmer_base <- glmer(lihpnc_click_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+lihpnc_click_glmer_dev <- glmer(lihpnc_click_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+summary(lihpnc_click_glmer_base)
+summary(lihpnc_click_glmer_dev)
+```
+
+
+### MLM image view
+```{r}
+image_view_glmer_base <- glmer(images_viewed_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+#image_view_glmer_ho <- glmer(images_viewed_flag ~ holdout_group*in_prev_holdout + (1|ucdmid), family = "binomial", data = inputs, nAGQ = 0)
+image_view_glmer_dev <- glmer(images_viewed_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+
+summary(image_view_glmer_base)
+#summary(image_view_glmer_ho)
+summary(image_view_glmer_dev)
+
+```
+
+
+### MLM image upload
+```{r}
+image_upload_glmer_base <- glmer(images_uploaded_flag ~ holdout_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+image_upload_glmer_dev <- glmer(images_uploaded_flag ~ holdout_group*device_group + (1|ucdmid), family = "binomial", data = inputs[inputs$in_dau_table_this_week==1,], nAGQ = 0)
+
+summary(image_upload_glmer_base)
+summary(image_upload_glmer_dev)
+
+```
+
+```{r}
+
+
+search_glmer <- glmer(max_search_flag ~ holdout_group + week_number_c + (1+week_number_c|ucdmid), 
+                      family = "binomial", data = inputs, nAGQ = 0)
+summary(search_glmer) # p = .004
+summary(glm(search_flag ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .004
+summary(glm(max_search_flag ~ holdout_group, data = inputs_alltime, family = "binomial"))
+
+search_click_glmer <- glmer(max_search_click ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+                            family = "binomial", data = inputs, nAGQ = 0)
+summary(search_click_glmer) # p = .416
+summary(glm(max_search_click ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .009
+summary(glm(max_search_click ~ holdout_group, data = inputs_alltime, family = "binomial")) # p = .0005
+
+
+search_success_glmer <- glmer(max_search_success ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+                              family = "binomial", data = inputs, nAGQ = 0)
+summary(search_success_glmer) # p = .672
+summary(glm(max_search_success ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .7856
+summary(glm(max_search_success ~ holdout_group, data = inputs_alltime, family = "binomial")) # p = .38
+
+nodes_glmer <- glmer(max_nodes ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+                     family = "binomial", data = inputs, nAGQ = 0)
+summary(nodes_glmer) # p = .187
+summary(glm(max_nodes ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .197
+summary(glm(max_nodes ~ holdout_group, data = inputs_alltime, family = "binomial")) # p = .304
+
+
+hints_gen_glmer <- glmer(max_hints_gen ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+              family = "binomial", data = inputs, nAGQ = 0)
+summary(hints_gen_glmer) # p = .543
+summary(glm(max_hints_gen ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .23
+summary(glm(max_hints_gen ~ holdout_group, data = inputs_alltime, family = "binomial")) # p = .67
+
+
+hints_review_glmer <- glmer(max_hints_review ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+              family = "binomial", data = inputs, nAGQ = 0)
+summary(hints_review_glmer) # p = .149
+summary(glm(max_hints_review ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .495
+summary(glm(max_hints_review ~ holdout_group, data = inputs_alltime, family = "binomial")) # p = .0187
+
+
+hints_interact_glmer <- glmer(max_hints_interact ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+              family = "binomial", data = inputs, nAGQ = 0)
+summary(hints_interact_glmer) # p = .0176
+summary(glm(max_hints_interact ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .00353
+summary(glm(max_hints_interact ~ holdout_group, data = inputs_alltime, family = "binomial")) # p = .009
+
+
+
+hints_accept_glmer <- glmer(max_hints_accept ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+              family = "binomial", data = inputs, nAGQ = 0)
+summary(hints_accept_glmer) # p = .06
+summary(glm(max_hints_accept ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .025
+summary(glm(max_hints_accept ~ holdout_group, data = inputs_alltime, family = "binomial")) # p = .025
+
+
+
+lihpnc_view_glmer <- glmer(max_lihpnc_view ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+              family = "binomial", data = inputs, nAGQ = 0)
+summary(lihpnc_view_glmer) # p = .766
+summary(glm(max_lihpnc_view ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .0773
+summary(glm(max_lihpnc_view ~ holdout_group, data = inputs_alltime, family = "binomial")) # p = .175
+
+
+
+lihpnc_click_glmer <- glmer(max_lihpnc_click ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+              family = "binomial", data = inputs[inputs$max_lihpnc_view ==1,], nAGQ = 0)
+summary(lihp_clicknc_glmer) # p = .03
+summary(glm(max_lihp_click ~ holdout_group + week_number_c, 
+            data = inputs[inputs$max_lihp_view==1,], family = "binomial")) # p < .001
+summary(glm(max_lihp_click ~ holdout_group, data = inputs_alltime[inputs_alltime$max_lihp_view==1,], family = "binomial")) # p < .001
+
+
+
+
+image_view_glmer <- glmer(max_images_viewed ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+              family = "binomial", data = inputs, nAGQ = 0)
+summary(image_view_glmer) # p = .0129
+summary(glm(max_images_viewed ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .0006
+
+image_uploaded_glmer <- glmer(max_images_uploaded ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid), 
+              family = "binomial", data = inputs, nAGQ = 0)
+summary(image_uploaded_glmer) # p = .27
+summary(glm(max_images_uploaded ~ holdout_group + week_number_c, data = inputs, family = "binomial")) # p = .086
+
+
+hint_ratio_lmer <- lmer(hint_ratio ~ holdout_group + week_number_c + (1 + week_number_c|ucdmid),
+                        data = inputs[inputs$ucdmid %in% random_users,], control=lmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(hint_ratio_lmer)
+summ(hint_ratio_lmer)
+plot(allEffects(hint_ratio_lmer))
+summary(lm(hint_ratio ~ holdout_group + week_number_c, data = inputs[inputs$max_hints_interact>0,]))
+
+
+summary(glm(max_hints_gen ~ holdout_group * week_number_c , data = inputs, family = "binomial"))
+summary(glm(max_hints_review ~ holdout_group * week_number_c, data = inputs, family = "binomial"))
+summary(glm(max_hints_interact ~ holdout_group, data = inputs, family = "binomial"))
+summary(glm(max_hints_interact ~ holdout_group * week_number_c, data = inputs, family = "binomial"))
+summary(glm(max_hints_interact ~ holdout_group * week_number_c, data = inputs, family = "binomial"))
+summary(glm(max_hints_interact ~ holdout_group * week_number_c, data = inputs, family = "binomial"))
+summary(glm(max_hints_interact ~ holdout_group * week_number_c, data = inputs, family = "binomial"))
+
+```
+
+```{r}
+colnames(inputs_alltime)
+inputs_alltime$holdout_rev <- factor(inputs_alltime$holdout_group, levels = c("Non-Holdout","Holdout"))
+confint(glm(max_nodes ~ holdout_group, data = inputs_alltime, family = "binomial"))
+confint(glm(max_nodes ~ holdout_rev, data = inputs_alltime, family = "binomial"))
+summary(glm(max_nodes ~ holdout_rev, data = inputs_alltime, family = "binomial"))
+tab_model(glm(max_nodes ~ holdout_rev, data = inputs_alltime, family = "binomial"),show.est = T,show.stat = T,show.r2 = F)
+```
+
+# SRM investigations
+```{r}
+#  Read data from db
+pg = dbDriver("PostgreSQL")
+cdw <-  dbConnect(pg, user = db_user, password = db_password,dbname = db_name, host = db_host, port = db_port)
+
+query <- "SELECT distinct *
+FROM a.aw_edgenode_userbase
+;
+"
+
+edgenode <- fetch(dbSendQuery(cdw, query), n = -1)
+
+```
+
+```{r}
+
+colnames(raw)
+table(raw$holdout_group) %>% prop.table()
+
+raw %>% mutate(grand_n = n_distinct(ucdmid)) %>% 
+  group_by(holdout_group,grand_n) %>% 
+  reframe(n_users_in_group = n_distinct(ucdmid),
+            prop_users = n_users_in_group / grand_n) %>% distinct() %>%
+  ggplot(aes(x = holdout_group, y = prop_users)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(prop_users,2)),
+            position = position_dodge2(width = .9, preserve = "single"), vjust = -.5, size = 4) +
+  theme_classic(base_size = 14)
+
+raw %>% group_by(package_type) %>% mutate(n_per_package = n_distinct(ucdmid)) %>% 
+  group_by(package_type, holdout_group,n_per_package) %>% 
+  reframe(n_users_in_group = n_distinct(ucdmid),
+            percent_users = 100 * n_users_in_group / n_per_package) %>% distinct() %>%
+  filter(holdout_group == "Holdout") %>%
+  ggplot(aes(x = holdout_group, y = percent_users, fill = package_type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(percent_users,4)),
+            position = position_dodge2(width = .9, preserve = "single"), vjust = -.5, size = 4) +
+  theme_classic(base_size = 14)
+
+raw %>% group_by(age_group) %>% mutate(n_per_package = n_distinct(ucdmid)) %>% 
+  group_by(age_group, holdout_group,n_per_package) %>% 
+  reframe(n_users_in_group = n_distinct(ucdmid),
+            percent_users = 100 * n_users_in_group / n_per_package) %>% distinct() %>%
+  filter(holdout_group == "Holdout") %>%
+  ggplot(aes(x = holdout_group, y = percent_users, fill = age_group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(percent_users,4)),
+            position = position_dodge2(width = .9, preserve = "single"), vjust = -.5, size = 4) +
+  theme_classic(base_size = 14)
+
+raw %>% group_by(duration) %>% mutate(n_per_package = n_distinct(ucdmid)) %>% 
+  group_by(duration, holdout_group,n_per_package) %>% 
+  reframe(n_users_in_group = n_distinct(ucdmid),
+            percent_users = 100 * n_users_in_group / n_per_package) %>% distinct() %>%
+  filter(holdout_group == "Holdout") %>%
+  ggplot(aes(x = holdout_group, y = percent_users, fill = duration)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(percent_users,4)),
+            position = position_dodge2(width = .9, preserve = "single"), vjust = -.5, size = 4) +
+  theme_classic(base_size = 14)
+
+inputs_alltime %>% group_by(duration) %>% mutate(n_per_package = n_distinct(ucdmid)) %>% 
+  group_by(duration, holdout_group,n_per_package) %>% 
+  reframe(n_users_in_group = n_distinct(ucdmid),
+            percent_users = 100 * n_users_in_group / n_per_package) %>% distinct() %>%
+  filter(holdout_group == "Holdout") %>%
+  ggplot(aes(x = holdout_group, y = percent_users, fill = duration)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  geom_text(aes(label = round(percent_users,4)),
+            position = position_dodge2(width = .9, preserve = "single"), vjust = -.5, size = 4) +
+  theme_classic(base_size = 14)
+```
+
+
+```{r}
+signup_device <- read.csv(file = "~/Downloads/Result#343524.csv", header = T)
+signup_device %>% filter(holdout_group != '') %>%
+  group_by(signup_device) %>% mutate(n_per_device = sum(n_users)) %>% 
+  filter(holdout_group == "Holdout") %>%
+  mutate(percent_users =100 *  n_users / n_per_device) %>% 
+  ggplot(aes(x = holdout_group, y = percent_users, fill = signup_device)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .8),color = "gray50", width = .8) +
+  scale_y_continuous(name = "Percent of users in holdout", n.breaks = 10) + 
+  geom_text(aes(label = round(percent_users,4)),
+            position = position_dodge2(width = .9, preserve = "single"), vjust = -.5, size = 4) +
+  coord_cartesian(ylim = c(3,5.5)) + 
+  theme_classic(base_size = 14)
+```
+
+
+
+```{r}
+ho_comp <- inputs %>% 
+  group_by(ucdmid) %>%
+  summarise(total_ss_table_entries = sum(in_ss_table_this_week=='in ss table'),
+            holdout_group = first(holdout_group),
+            prev_holdout_group = first(prev_holdout_group),
+            age = min(age),
+            duration = first(duration)) %>%
+  distinct(ucdmid, total_ss_table_entries,holdout_group, prev_holdout_group, age, duration) %>% 
+  mutate(in_prev_holdout = prev_holdout_group != "not in prev ho",
+         holdout_bool = holdout_group == "Holdout")
+table(ho_comp$holdout_group) %>% prop.table()
+table(ho_comp$in_prev_holdout) %>% prop.table()*100
+table(ho_comp$prev_holdout_group) %>% prop.table()*100
+table(ho_comp$holdout_group, ho_comp$prev_holdout_group) %>% prop.table(2)
+table(ho_comp$holdout_group, ho_comp$in_prev_holdout) %>% prop.table(2)
+
+ho_comp$age_poiss <- ho_comp$age
+ho_comp$age_poiss[is.na(ho_comp$age)] <- 0
+
+hist(ho_comp$age_poiss)
+
+summary(xtabs(~ holdout_group + prev_holdout_group, data = ho_comp))
+summary(xtabs(~ holdout_group + in_prev_holdout, data = ho_comp))
+summary(glm(holdout_bool ~ in_prev_holdout, data = ho_comp, family = "binomial"))
+summary(glm(holdout_bool ~ prev_holdout_group, data = ho_comp, family = "binomial"))
+
+summary(zeroinfl(age_poiss ~ holdout_group*prev_holdout_group, data = ho_comp, dist = "poisson"))
+summary(zeroinfl(total_ss_table_entries ~ holdout_group, data = ho_comp, dist = "poisson"))
+
+
+hist(ho_comp$total_ss_table_entries[ho_comp$holdout_group == "Holdout"])
+hist(ho_comp$total_ss_table_entries[ho_comp$holdout_group == "Non-Holdout"])
+
+View(inputs[inputs$age > 110 & !is.na(inputs$age),])
+```
+
+```{r}
+ggplot(ho_comp, aes(x = age_poiss, y = holdout_group)) +
+  geom_density_ridges(aes(fill = prev_holdout_group, color = prev_holdout_group), 
+                      scale = .9, alpha = .3, size = .5) +
+  scale_color_manual(values = c("#00AFBB", "#E7B800", "#FC4E07")) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800", "#FC4E07")) +
+  theme_classic() + 
+  theme(legend.position = "bottom")
+
+ggplot(ho_comp, aes(x = age_poiss, y = prev_holdout_group)) +
+  geom_density_ridges(aes(fill = holdout_group, color = holdout_group), 
+                      scale = .9, alpha = .2, size = .5) +
+  scale_color_manual(values = c("gray40", "#E7B800")) +
+  scale_fill_manual(values = c("gray40", "#E7B800")) +
+  scale_x_continuous(n.breaks = 20)+
+  coord_cartesian(xlim = c(0,100)) + 
+  theme_classic() + 
+  theme(legend.position = "bottom")
+
+ggplot(ho_comp, aes(x = age_poiss, y = prev_holdout_group)) +
+  geom_density_ridges(aes(fill = holdout_group, color = holdout_group), 
+                      scale = .9, alpha = .2, size = .5) +
+  scale_color_manual(values = c("gray40", "#E7B800")) +
+  scale_fill_manual(values = c("gray40", "#E7B800")) +
+  scale_x_continuous(n.breaks = 20)+
+  coord_cartesian(xlim = c(0,100)) + 
+  facet_wrap(facets = "duration") +
+  theme_classic() + 
+  theme(legend.position = "bottom")
+```
+
+```{r}
+summary(lm(age ~ holdout_group + prev_holdout_group, data = ho_comp))
+table(is.na(ho_comp$age), ho_comp$prev_holdout_group) %>% prop.table(1)*100
+```
+
+```{r}
+inputs$ufr_in_interval <- as.numeric(inputs$ufrdate >= '2023-03-11' & inputs$ufrdate <= '2023-03-24')
+culled$ufr_in_interval <- as.numeric(culled$ufrdate >= '2023-03-11' & culled$ufrdate <= '2023-03-24')
+
+table(inputs$ufr_in_interval) %>% prop.table()
+table(culled$ufr_in_interval) %>% prop.table()
+
+table(culled$ufr_in_interval, culled$holdout_group) %>% prop.table(1)
+table(culled$ufr_in_interval, culled$duration) %>% prop.table(1)*100
+
+table(culled$ufr_in_interval[culled$holdout_group == "Holdout"], culled$device_group[culled$holdout_group=="Holdout"]) %>% prop.table(1)
+table(culled$ufr_in_interval[culled$holdout_group == "Non-Holdout"], culled$device_group[culled$holdout_group=="Non-Holdout"]) %>% prop.table(1)
+
+table(culled$ufr_in_interval[culled$holdout_group == "Holdout"], culled$os_group[culled$holdout_group=="Holdout"]) %>% prop.table(1)*100
+table(culled$ufr_in_interval[culled$holdout_group == "Non-Holdout"], culled$os_group[culled$holdout_group=="Non-Holdout"]) %>% prop.table(1)*100
+
+summary(glm(num_hints_reviewed ~ ufr_in_interval, data = inputs, family = 'quasipoisson'))
+summary(glm.nb(num_hints_reviewed ~ ufr_in_interval, data = inputs))
+summary(zeroinfl(num_hints_reviewed ~ ufr_in_interval, data = inputs, dist = "negbin"))
+
+summary(glm.nb(num_hints_reviewed ~ ufr_in_interval*holdout_group, data = inputs))
+
+
+summary(glm(num_hints_decided ~ ufr_in_interval, data = inputs, family = 'quasipoisson'))
+summary(glm.nb(num_hints_decided ~ ufr_in_interval, data = inputs))
+summary(zeroinfl(num_hints_decided ~ ufr_in_interval, data = inputs, dist = "negbin"))
+
+nbmod <- (glm.nb(num_hints_decided ~ ufr_in_interval*holdout_group, data = inputs))
+newdata1 <- data.frame(
+  ufr_in_interval = rep(as.numeric(rep(0:1,each = 100)),2),
+  holdout_group = factor(rep(1:2, each = 200), levels = 1:2, labels = c("Holdout","Non-Holdout")))
+newdata1 <- cbind(newdata1, predict(nbmod, newdata1, type = "link", se.fit = T))
+
+newdata1 <- within(newdata1, {
+  num_hints_decided <- exp(fit)
+  LL <- exp(fit - 1.96 * se.fit)
+  UL <- exp(fit + 1.96 * se.fit)
+})
+
+ggplot(newdata1, aes(ufr_in_interval, num_hints_decided)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL, fill = holdout_group), alpha = .25) +
+  geom_line(aes(colour = holdout_group), size = 2) +
+  scale_x_continuous(n.breaks = 2)+
+  labs(x = "ufr_in_interval", y = "num_hints_decided")
+
+
+summary(glm.nb(num_hints_accepted~ ufr_in_interval*holdout_group, data = inputs))
+
+summary(lm(age~ ufr_in_interval*holdout_group, data = culled))
+summary(glm(in_ss_table_this_tenure~ ufr_in_interval*holdout_group, data = culled, family = "binomial"))
+summary(glm(total_sessions~ ufr_in_interval*holdout_group, data = culled, family = "quasipoisson"))
+
+summary(glmer(renewal_flag~ ufr_in_interval*holdout_group + (1|ucdmid), data = culled, family = "binomial"))
+
+```
+
+# survival
+Pivot into wide format 
+```{r}
+colnames(culled)
+
+# create wide df where each row is one ucdmid's subscription streak
+wide <- culled %>% 
+  filter(ufrdate < Sys.Date() - 9,
+         in_dau_table_this_tenure==1) %>% 
+  group_by(ucdmid,age_group,duration,gsacohortwebserviceid,holdout_group,enter_date,age,email_type,package_type) %>% 
+  arrange(ucdmid,ufrdate) %>% 
+  mutate(term = row_number(),n_terms = max(term)) %>% 
+  filter(n_terms < 5) %>% 
+  pivot_wider(id_cols = c("ucdmid","age_group","duration","gsacohortwebserviceid","holdout_group","enter_date","age","email_type","package_type"),
+              values_from = c(tvalue_num,
+                              #prop_days_in_ss_table,
+                              prop_days_in_dau_table,
+                              cancel_date,
+                              ufrdate,
+                              renewal_flag),
+              names_glue = "{.value}_{term}",
+              names_from = term) 
+head(wide)
+```
+
+
+
+
+Some of these ucdmids are duplicated, and it's hard to tell why because each row should be a unique subscription for a unique user, and some users seem to have overlapping subscriptions? This is only .2% of all users, so one option is to just drop all ucdmids that occur more than once in the df since each row is supposed to represent one user.
+```{r}
+sum(duplicated(wide$ucdmid)) / nrow(wide)
+
+table(wide$renewal_flag_1) %>% prop.table() * 100
+
+# keep only unique ucdmid rows 
+
+wide <- wide[-which(wide$ucdmid %in% wide$ucdmid[which(duplicated(wide$ucdmid))]),]
+
+table(wide$renewal_flag_1) %>% prop.table() * 100
+
+
+# free up some RAM 
+#rm(monthly_wide)
+```
+
+
+
+
+# Survival
+Based on code from https://socialsciences.mcmaster.ca/jfox/Books/Companion/appendices/Appendix-Cox-Regression.pdf
+
+
+```{r}
+colnames(wide)
+
+# minimum value of all the renewal_flag columns indicates whether the ucdmid ever churned
+wide$ever_churned <- as.numeric((apply(X = wide[,c(26:29)], MARGIN = 1, FUN = min, na.rm=T)) == 0)
+# maximum value of all the cancel insert date columns indicates the date that the ucdmid either churned or was censored
+wide$max_ufrdate <- as_date(apply(X = wide[,c(22:25)], MARGIN = 1, FUN = max, na.rm=T))
+
+
+wide$n_days_survived <- NA
+wide$n_days_survived[wide$ever_churned == 1] <- as.numeric(as_date(wide$max_ufrdate[wide$ever_churned == 1])) - as.numeric(as_date(wide$enter_date[wide$ever_churned == 1]))
+wide$n_days_survived[wide$ever_churned == 0] <- as.numeric(Sys.Date()) - as.numeric(as_date(wide$enter_date[wide$ever_churned == 0]))
+
+wide <- wide[-which(wide$n_days_survived <=0),]
+
+wide$package_aa[wide$package_type=="All Access"] <- "All Access"
+wide$package_aa[wide$package_type!="All Access"] <- "Other"
+wide$duration_monthly[wide$duration=="Monthly"] <- "Monthly"
+wide$duration_monthly[wide$duration!="Monthly"] <- "Other"
+```
+
+intercept-only survival model 
+
+```{r}
+# intercept-only survival model 
+# output shows a row for each time point where either the event occured or a sample was censored. It shows the number at risk (number still remaining), and the cumulative survival at that instant.
+summary(survfit(Surv(n_days_survived,ever_churned)~1, data=wide))
+
+ggsurvplot(survfit(Surv(n_days_survived,ever_churned)~1, data=wide),
+           ylim = c(.2,1),size = .5,censor.shape = 124, censor.size = 1) $plot +   scale_x_continuous(n.breaks = 12) 
+
+```
+
+```{r}
+plot(survfit(Surv(n_days_survived,ever_churned) ~ as.factor(duration_monthly),data=wide), ylim = c(.5,1))
+
+lines(predict(survreg(Surv(n_days_survived,ever_churned) ~ as.factor(duration_monthly),dist='weibull',data=wide), 
+              newdata = list(duration_monthly = "Other"), 
+              type="quantile",p=seq(.01,.99,by=.01)), 
+      seq(.99,.01,by=-.01), col="blue")
+lines(predict(survreg(Surv(n_days_survived,ever_churned) ~ as.factor(duration_monthly),dist='weibull',data=wide), 
+              newdata = list(duration_monthly = "Monthly"), 
+              type="quantile",p=seq(.01,.99,by=.01)), 
+      seq(.99,.01,by=-.01),col="red")
+
+lfit <- survreg(Surv(n_days_survived,ever_churned) ~ as.factor(duration_monthly),dist='weibull',data=wide)
+ptime <- predict(lfit, newdata=data.frame(duration_monthly="Monthly"), type='quantile',
+                 p=seq(.01,.99,by=.01), se=TRUE)
+ptime2 <- predict(lfit, newdata=data.frame(duration_monthly="Other"), type='quantile',
+                 p=seq(.01,.99,by=.01), se=TRUE)
+matplot(cbind(ptime$fit, 
+              ptime$fit + 2*ptime$se.fit, 
+              ptime$fit - 2*ptime$se.fit,
+              ptime2$fit,
+              ptime2$fit + 2*ptime2$se.fit, 
+              ptime2$fit - 2*ptime2$se.fit), 
+        1-(seq(.01,.99,by=.01)),type='l', lty=c(1,2,2), col=c(1,1,1,2,2,2))
+```
+
+```{r}
+
+survfit_summary <- summary(survfit(Surv(n_days_survived,ever_churned)~package_aa, data=wide))
+
+
+bind_cols(time = survfit_summary$time, group = survfit_summary$strata, survival_aa = survfit_summary$surv) %>% filter(group == "package_aa=All Access") %>%
+  inner_join(bind_cols(time = survfit_summary$time, group = survfit_summary$strata, survival_other = survfit_summary$surv) %>% filter(group == "package_aa=Other"), by = "time") %>%
+  select(-c(group.x,group.y)) %>%
+  mutate(rr_diff = round(survival_other - survival_aa, 4))
+```
+
+
+The exponentiated coefficients are multiplicative effects on the hazard: one unit change in X reduces the hazard of churn by a factor of exp(coef) on average, or 100*(1-exp(coef))%
+
+```{r}
+mod.allison <- coxph(Surv(n_days_survived, ever_churned) ~ package_aa, data = wide, na.action = na.omit, x = T, y = T)
+summary(mod.allison)
+
+mod2.allison <- coxph(Surv(n_days_survived, ever_churned) ~ package_aa + prop_days_in_ss_table_1, data = wide, na.action = na.omit)
+summary(mod2.allison)
+
+
+lrtest(mod.allison,mod2.allison)
+
+
+
+summary(survreg(Surv(n_days_survived, ever_churned) ~ holdout_group, data = wide, na.action = na.omit, dist = "gaussian"))
+
+```
+
+The Anova() function in the car package has a method for "coxph" objects, by default computing Type-II likelihood-ratio tests for the terms in the model:
+```{r}
+library("car")
+Anova(mod.allison)
+```
+Having fit a Cox model to the data, it is often of interest to examine the estimated distribution of survival times. The survfit() function estimates S(t), by default at the mean values of the covariates. The plot() method for objects returned by survfit() graphs the estimated survival function, along with a point-wise 95-percent confidence band. 
+
+
+```{r fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+
+ggsurvplot(survfit(formula = Surv(n_days_survived,ever_churned) ~ holdout_group , data = wide), 
+           conf.int=TRUE, pval=F, risk.table=F, 
+          # palette=c("dodgerblue2", "orchid2"), 
+          size = .6,censor.shape = 124, censor.size = 1)$plot + 
+  scale_x_continuous(n.breaks = 12) +
+  coord_cartesian(ylim = c(.6,1)) +
+  #facet_wrap(facets = "duration") +
+  theme_classic(base_size = 16) + 
+  theme(legend.position = "bottom", legend.title=element_text(size=9), legend.text=element_text(size=8))
+
+ggsurvplot(survfit(formula = Surv(n_days_survived,ever_churned) ~ package_aa, data = wide), 
+           conf.int=TRUE, pval=F, risk.table=F, 
+          size = .6,censor.shape = 124, censor.size = 1)$plot + 
+  scale_x_continuous(n.breaks = 12) +
+ # coord_cartesian(xlim = c(0,60),ylim = c(.6,1)) +
+  theme_classic(base_size = 16) + 
+  theme(legend.position = "bottom", legend.title=element_text(size=9), legend.text=element_text(size=8))
+
+ggsurvplot(survfit(formula = Surv(n_days_survived,ever_churned) ~ holdout_group + duration , data = wide), 
+           conf.int=TRUE, pval=F, risk.table=F, 
+           #palette=c("#FF4C51","#70DBDC", "orchid2"), 
+          size = .6,censor.shape = 124, censor.size = 1)$plot + 
+  scale_x_continuous(n.breaks = 12) +
+  coord_cartesian(xlim = c(0,60),ylim = c(.6,1)) +
+  facet_wrap(facets = "duration") +
+  theme_classic(base_size = 16) + 
+  theme(legend.position = "bottom", legend.title=element_text(size=6), legend.text=element_text(size=4))
+
+
+ggsurvplot(survfit(formula = Surv(n_days_survived,ever_churned) ~ duration , data = wide), 
+           conf.int=TRUE, pval=F, risk.table=T, test.for.trend = T,
+           #palette=c("#FF4C51","#70DBDC", "orchid2"), 
+          size = .6,censor.shape = 124, censor.size = 1)$plot + 
+  scale_x_continuous(n.breaks = 12) +
+  coord_cartesian(xlim = c(0,60),ylim = c(.6,1)) +
+  theme_classic(base_size = 16) + 
+  theme(legend.position = "bottom", legend.title=element_text(size=6), legend.text=element_text(size=4))
+```
+
