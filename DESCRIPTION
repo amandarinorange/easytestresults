@@ -11,14 +11,14 @@ License: GPL-3
 Encoding: UTF-8
 LazyData: true
 Imports: 
-    dplyr
-    lmtest
-    tibble
-    MASS
-    stats
-    emmeans
-    interactions
-    tidyr
+    dplyr,
+    lmtest,
+    tibble,
+    MASS,
+    stats,
+    emmeans,
+    interactions,
+    tidyr,
     purrr
 Suggests: 
     testthat (>= 3.0.0)
