@@ -10,7 +10,6 @@
 #'
 #' @describeIn easy_results Reports pairwise results from an A/B/n test where each treatment condition is contrasted with the reference group
 #'
-#'    Returns no value. Not indented.
 #'
 #' @param outcome The name of the column holding the dependent variable (aka y variable/outcome), specified inside quotation marks
 #' @param treatment_name The name of the column holding the experimental treatment name, specified inside quotation marks
@@ -114,8 +113,8 @@ easy_results <- function(outcome, treatment_name, df, family) {
 
 
   fit_cis <- fit_data %>%
-    mutate(est_ci = gsub(x = (paste('[',round(ymin,6),',',round(ymax,6),']')), pattern = " ", replacement = "")) %>%
-    select(c(2,"est_ci")) %>%
+    dplyr::mutate(est_ci = gsub(x = (paste('[',round(ymin,6),',',round(ymax,6),']')), pattern = " ", replacement = "")) %>%
+    dplyr::select(c(2,"est_ci")) %>%
     pivot_wider(names_from = 1, values_from = c("est_ci"))
 
   colnames(fit_cis) <- paste(colnames(fit_cis),"estci",sep="_")
@@ -124,7 +123,7 @@ easy_results <- function(outcome, treatment_name, df, family) {
   fit_final <- fit_stats %>%
     cbind(fit_cis)
   fit_final <- fit_final %>%
-    select(c(1,order(colnames(fit_final)))) %>%
+    dplyr::select(c(1,order(colnames(fit_final)))) %>%
     discard(~all(is.na(.) | . ==""))
 
 
@@ -196,15 +195,16 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
   # Get confidence intervals
   intx_cis <- intx_plot$data %>%
-    mutate(est_ci = gsub(x = (paste('[',round(ymin,6),',',round(ymax,6),']')), pattern = " ", replacement = "")) %>%
-    select(c(2,3,"est_ci")) %>%
-    pivot_wider(names_from = 2, values_from = c("est_ci")) %>% select(-1)
+    dplyr::mutate(est_ci = gsub(x = (paste('[',round(ymin,6),',',round(ymax,6),']')), pattern = " ", replacement = "")) %>%
+    dplyr::select(c(2,3,"est_ci")) %>%
+    pivot_wider(names_from = 2, values_from = c("est_ci")) %>%
+    dplyr::select(-1)
 
   colnames(intx_cis) <- paste(colnames(intx_cis),"est_ci",sep="_")
 
   # Get relative lift
   intx_data <- intx_plot$data %>%
-    select(c(1,2,3)) %>%
+    dplyr::select(c(1,2,3)) %>%
     pivot_wider(names_from = 3, values_from = c(1))
 
   intx_lift <- vector(length = nrow(intx_data))
@@ -214,7 +214,8 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
     intx_lift <- cbind(intx_lift, lift)
   }
 
-  intx_lift <- intx_lift %>% select(-c("intx_lift"))
+  intx_lift <- intx_lift %>%
+    dplyr::select(-c("intx_lift"))
 
   colnames(intx_lift) <- paste(colnames(intx_lift),"lift",sep="_")
 
@@ -228,7 +229,7 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
                                  adjust = "none",
                                  type = "response",
                                  ratios = F)) %>%
-    select(-c("estimate","SE","df"))
+    dplyr::select(-c("estimate","SE","df"))
 
   em_c <- separate(data = em_c, col = contrast, into = c("reference", "comparison"), sep = " - ", remove = F)
 
@@ -237,12 +238,12 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
 
   intx_stats <- intx_plot$data %>%
-    select(c(1,2,3)) %>%
+    dplyr::select(c(1,2,3)) %>%
     dplyr::rename(est = 1) %>%
     left_join(y = em_c_comparison,
               by = setNames(c(user_segment,"reference"),
                             c(user_segment,treatment_name))) %>%
-    select(-c("contrast","comparison")) %>%
+    dplyr::select(-c("contrast","comparison")) %>%
     pivot_wider(names_from = 3, values_from = c(1,4,5)) %>%
     setNames(nm = sub("(.*)_(.*)", "\\2_\\1", names(.))) %>%
     cbind(intx_lift,intx_cis)
@@ -250,17 +251,22 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
   colnames(intx_stats) <- gsub(" ", "", colnames(intx_stats))
 
   intx_final <- intx_stats %>%
-    select(c(1,order(colnames(intx_stats)))) %>%
+    dplyr::select(c(1,order(colnames(intx_stats)))) %>%
     discard(~all(is.na(.) | . ==""))
 
 
   if (lrtest_res$`Pr(>Chisq)`[2] >= .05) {
-    warning <- paste("Warning! The interaction effect in this model is NOT significant. Beware with interpreting results of treatment by user segment!")
-    return(list(warning, cbind(outcome_variable = outcome, intx_final)))
+    warning <- paste("Warning! The interaction effect in this model is NOT significant at p = ",
+                     round(lrtest_res$`Pr(>Chisq)`[2], 3),
+                     ". Beware with interpreting results of treatment by user segment!")
+    #return(list(warning, cbind(outcome_variable = outcome, intx_final)))
+    return(cbind(outcome_variable = outcome, intx_final, warning))
   }
 
   if (lrtest_res$`Pr(>Chisq)`[2] < .05) {
-    return(cbind(outcome_variable = outcome, intx_final))
+    notawarning <- paste("The interaction effect in this model is significant at p = ",
+                         round(lrtest_res$`Pr(>Chisq)`[2], 3))
+    return(cbind(outcome_variable = outcome, intx_final, notawarning))
   }
 
 }
