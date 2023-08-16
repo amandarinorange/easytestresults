@@ -149,7 +149,7 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
   if (!is.numeric(df[,outcome_col_ind]) & family == "logit") {
     stop("Outcome variable must be numeric (0 or 1) for logistic regression")
   }
-  if (sum(df[,outcome_col_ind] - floor(df[,outcome_col_ind])!=0)==0 & family == "negbin") {
+  if (sum(df[,outcome_col_ind] - floor(df[,outcome_col_ind])!=0)!=0 & family == "negbin") {
     stop("Outcome variable must be integer for negative binomial regression")
   }
   intx <- paste(treatment_name, user_segment, sep = "*")
