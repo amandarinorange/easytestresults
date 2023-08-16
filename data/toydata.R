@@ -22,6 +22,12 @@
 #'
 "toydata"
 
+packages <- c("diversitree", "broom", "rempsyc", "rando", "car", "kableExtra", "gtools", "stringi", "RColorBrewer", "tm", "stringr",
+              "data.table", "caret", "lubridate", "sjmisc", "ggpubr", "ggplot2", "knitr", "cluster", "factoextra", "magrittr",
+              "tidyverse", "lmerTest", "lmtest", "lme4", "dplyr", "forcats", "twang", "RVAideMemoire", "fastDummies", "DBI", "RPostgreSQL",
+              "Rmisc", "pscl", "boot", "MASS", "fitdistrplus", "gamlss", "emdbook", "interactions", "emmeans")
+lapply(packages, require, character.only = TRUE)
+
 # Set the number of observations
 n <- 500
 
@@ -44,8 +50,7 @@ segment <- sample(segment_levels, n, replace = TRUE)
 
 # Create the data frame
 toydata <- data.frame(outcome_norm, outcome_binom, outcome_nbinom, condition, segment)
-
+toydata$segment <- as.factor(toydata$segment)
 
 save(toydata, file = "~/Documents/easytestresults//data/toydata.RData")
-df <- toydata
-colnames(df)
+
