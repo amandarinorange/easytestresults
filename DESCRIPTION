@@ -9,7 +9,6 @@ Description: This package includes two functions for outputting A/B/n test resul
     The function easy_results_segmented() reports simple effects of treatment within each level of a third, categorical independent variable -- most typically a user segment column.
 License: GPL-3
 Encoding: UTF-8
-LazyData: true
 Imports: 
     dplyr,
     lmtest,
