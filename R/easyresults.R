@@ -57,8 +57,8 @@ easy_results <- function(outcome, treatment_name, df, family) {
     for (i in 2:nrow(fit_stats)) {
       fit_stats$est[i] <- plogis(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i])
       fit_stats$z[i] <- fit_coeffs$`z value`[i]
-      fit_stats$p[i] <- fit_coeffs$`Pr(>|z|)`[i]
-      fit_stats$lift[i] <- 100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1]
+      fit_stats$p[i] <- ifelse(test = fit_coeffs$`Pr(>|z|)`[i] < .001, yes = '<.001', no = fit_coeffs$`Pr(>|z|)`[i])
+      fit_stats$lift[i] <- paste(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1],'%')
     }
   }
 
@@ -75,8 +75,8 @@ easy_results <- function(outcome, treatment_name, df, family) {
     for (i in 2:nrow(fit_stats)) {
       fit_stats$est[i] <- fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i]
       fit_stats$t[i] <- fit_coeffs$`t value`[i]
-      fit_stats$p[i] <- fit_coeffs$`Pr(>|t|)`[i]
-      fit_stats$lift[i] <- 100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1]
+      fit_stats$p[i] <- ifelse(test = fit_coeffs$`Pr(>|t|)`[i] < .001, yes = '<.001', no = fit_coeffs$`Pr(>|t|)`[i])
+      fit_stats$lift[i] <- paste(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1],'%')
     }
   }
 
@@ -94,8 +94,8 @@ easy_results <- function(outcome, treatment_name, df, family) {
     for (i in 2:nrow(fit_stats)) {
       fit_stats$est[i] <- exp(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i])
       fit_stats$z[i] <- fit_coeffs$`z value`[i]
-      fit_stats$p[i] <- fit_coeffs$`Pr(>|z|)`[i]
-      fit_stats$lift[i] <- 100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1]
+      fit_stats$p[i] <- ifelse(test = fit_coeffs$`Pr(>|z|)`[i] < .001, yes = '<.001', no = fit_coeffs$`Pr(>|z|)`[i])
+      fit_stats$lift[i] <- paste(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1],'%')
     }
   }
 
@@ -113,7 +113,7 @@ easy_results <- function(outcome, treatment_name, df, family) {
 
 
   fit_cis <- fit_data %>%
-    dplyr::mutate(est_ci = gsub(x = (paste('[',round(ymin,6),',',round(ymax,6),']')), pattern = " ", replacement = "")) %>%
+    dplyr::mutate(est_ci = gsub(x = (paste('[',round(ymin,4),', ',round(ymax,4),']')), pattern = " ", replacement = "")) %>%
     dplyr::select(c(2,"est_ci")) %>%
     pivot_wider(names_from = 1, values_from = c("est_ci"))
 
@@ -195,7 +195,7 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
   # Get confidence intervals
   intx_cis <- intx_plot$data %>%
-    dplyr::mutate(est_ci = gsub(x = (paste('[',round(ymin,6),',',round(ymax,6),']')), pattern = " ", replacement = "")) %>%
+    dplyr::mutate(est_ci = gsub(x = (paste('[',round(ymin,4),', ',round(ymax,4),']')), pattern = " ", replacement = "")) %>%
     dplyr::select(c(2,3,"est_ci")) %>%
     pivot_wider(names_from = 2, values_from = c("est_ci")) %>%
     dplyr::select(-1)
@@ -210,7 +210,7 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
   intx_lift <- vector(length = nrow(intx_data))
 
   for (i in 3:ncol(intx_data)) {
-    lift <- round(100 * (intx_data[,i] - intx_data[,2]) / intx_data[,2], 2)
+    lift <- paste(round(100 * (intx_data[,i] - intx_data[,2]) / intx_data[,2], 2),'%')
     intx_lift <- cbind(intx_lift, lift)
   }
 
@@ -232,6 +232,7 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
     dplyr::select(-c("estimate","SE","df"))
 
   em_c <- separate(data = em_c, col = contrast, into = c("reference", "comparison"), sep = " - ", remove = F)
+  em_c$p.value <- ifelse(test = em_c$p.value < .001, yes = '<.001', no = em_c$p.value)
 
   em_c_comparison <- em_c[em_c$comparison == levels(df[,treatment_name])[1],]
   #return(em_c)
@@ -265,7 +266,7 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
   if (lrtest_res$`Pr(>Chisq)`[2] < .05) {
     notawarning <- paste("The interaction effect in this model is significant at p = ",
-                         round(lrtest_res$`Pr(>Chisq)`[2], 3))
+                         ifelse(test = lrtest_res$`Pr(>Chisq)`[2] < .001, yes = '<.001', no = round(lrtest_res$`Pr(>Chisq)`[2], 3)))
     return(cbind(outcome_variable = outcome, intx_final, notawarning))
   }
 
