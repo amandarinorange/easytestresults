@@ -129,7 +129,7 @@ easy_results <- function(outcome, treatment_name, df, family) {
 
   colnames(fit_final) <- gsub(" ", "", colnames(fit_final))
 
-  return(as.data.frame(cbind(outcome_variable = outcome,fit_final)))
+  return(as.data.frame(cbind(outcome_variable = outcome, model_type = family, fit_final)))
 }
 
 #' @section function easy_results_segmented()
@@ -253,16 +253,21 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
 
   if (lrtest_res$`Pr(>Chisq)`[2] >= .05) {
-    warning <- paste("Warning! The interaction effect in this model is NOT significant at p = ",
+    interaction_significance <- paste("Warning! The interaction effect '",
+                     intx,
+                     "' is NOT SIGNIFICANT at p = ",
                      round(lrtest_res$`Pr(>Chisq)`[2], 3),
-                     ". Beware with interpreting results of treatment by user segment!")
-    return(cbind(outcome_variable = outcome, intx_final, warning))
+                     ". Beware with interpreting results of treatment by ",
+                     user_segment)
+    return(cbind(outcome_variable = outcome, model_type = family, intx_final, interaction_significance))
   }
 
   if (lrtest_res$`Pr(>Chisq)`[2] < .05) {
-    notawarning <- paste("The interaction effect in this model is significant at p = ",
+    interaction_significance <- paste("The interaction effect '",
+                                      intx,
+                                      "' is significant at p = ",
                          ifelse(test = lrtest_res$`Pr(>Chisq)`[2] < .001, yes = '<.001', no = round(lrtest_res$`Pr(>Chisq)`[2], 3)))
-    return(cbind(outcome_variable = outcome, intx_final, notawarning))
+    return(cbind(outcome_variable = outcome, model_type = family, intx_final, interaction_significance))
   }
 
 }
