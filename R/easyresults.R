@@ -75,7 +75,7 @@ easy_results <- function(outcome, treatment_name, df, family) {
     for (i in 2:nrow(fit_stats)) {
       fit_stats$est[i] <- round(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i], 3)
       fit_stats$t[i] <- round(fit_coeffs$`t value`[i],3)
-      fit_stats$p[i] <- ifelse(test = fit_coeffs$`Pr(>|t|)`[i] < .001, yes = '<.001', no = round(fit_coeffs$`Pr(>|t|)`[i],3))
+      fit_stats$p[i] <- fit_coeffs$`Pr(>|t|)`[i]
       fit_stats$lift[i] <- paste(round(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1], 3),'%')
     }
   }
@@ -94,7 +94,7 @@ easy_results <- function(outcome, treatment_name, df, family) {
     for (i in 2:nrow(fit_stats)) {
       fit_stats$est[i] <- round(exp(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i]), 3)
       fit_stats$z[i] <- round(fit_coeffs$`z value`[i], 3)
-      fit_stats$p[i] <- ifelse(test = fit_coeffs$`Pr(>|z|)`[i] < .001, yes = '<.001', no = round(fit_coeffs$`Pr(>|z|)`[i], 3))
+      fit_stats$p[i] <- fit_coeffs$`Pr(>|z|)`[i]
       fit_stats$lift[i] <- paste(round(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1], 3),'%')
     }
   }
@@ -210,7 +210,6 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
   intx_lift <- vector(length = nrow(intx_data))
 
   for (i in 3:ncol(intx_data)) {
-    #lift <- paste(round(100 * (intx_data[,i] - intx_data[,2]) / intx_data[,2], 3),'%')
     lift <- round((100 * (intx_data[,i] - intx_data[,2]) / intx_data[,2]), 3)
     intx_lift <- cbind(intx_lift, lift)
   }
@@ -220,11 +219,8 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
   colnames(intx_lift) <- paste(colnames(intx_lift),"lift_percent",sep="_")
 
-  #return(cbind(intx_cis,intx_lift))
-
   # Get coefficients, z-scores, and p-values
   em <- emmeans(fit_intx, as.formula(paste("~", intx)))
-  #return(em)
   em_c <- as.data.frame(contrast(em, method = "revpairwise",
                                  by = user_segment,
                                  adjust = "none",
@@ -233,7 +229,6 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
     dplyr::select(-c("estimate","SE","df"))
 
   em_c <- separate(data = em_c, col = contrast, into = c("reference", "comparison"), sep = " - ", remove = F)
-  em_c$p.value <- ifelse(test = em_c$p.value < .001, yes = '<.001', no = round(em_c$p.value,3))
 
   em_c_comparison <- em_c[em_c$comparison == levels(df[,treatment_name])[1],]
 
@@ -261,7 +256,6 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
     warning <- paste("Warning! The interaction effect in this model is NOT significant at p = ",
                      round(lrtest_res$`Pr(>Chisq)`[2], 3),
                      ". Beware with interpreting results of treatment by user segment!")
-    #return(list(warning, cbind(outcome_variable = outcome, intx_final)))
     return(cbind(outcome_variable = outcome, intx_final, warning))
   }
 
