@@ -57,7 +57,7 @@ easy_results <- function(outcome, treatment_name, df, family) {
     for (i in 2:nrow(fit_stats)) {
       fit_stats$est[i] <- round(plogis(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i]), 5)
       fit_stats$z[i] <- round(fit_coeffs$`z value`[i], 3)
-      fit_stats$p[i] <- ifelse(test = fit_coeffs$`Pr(>|z|)`[i] < .001, yes = '<.001', no = round(fit_coeffs$`Pr(>|z|)`[i],3))
+      fit_stats$p[i] <- fit_coeffs$`Pr(>|z|)`[i]
       fit_stats$lift[i] <- paste(round(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1], 3),'%')
     }
   }
@@ -272,4 +272,116 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
 }
 
+#' @section function easy_main_effects()
+#'
+#' @describeIn easy_main_effects Reports main effects of two factors on a binary, normal, or negative binomial outcome variable
+#'
+#' @export
+easy_main_effects <- function(outcome, me1, me2, df, family) {
+  me1_col_ind <- which(colnames(df) == me1)
+  me2_col_ind <- which(colnames(df) == me2)
+  outcome_col_ind <- which(colnames(df) == outcome)
 
+  cov <- paste(me1, me2, sep = "+")
+  f <- as.formula(paste(outcome, cov, sep="~"))
+  intx <- paste(me1, me2, sep = "*")
+  f_intx <- as.formula(paste(outcome, intx, sep="~"))
+
+  #if (!is.factor(df[,treatment_col_ind])) {
+  #  stop("x variables must be coded as a factor")
+  #}
+
+  if (family == "logit") {
+    if(!is.numeric(df[,outcome_col_ind])) {
+      stop("Outcome variable must be numeric (0 or 1)")
+    }
+    fit_stats <- rbind(data.frame(effect = 'control',est = NA, est_ci = NA, z = NA, p = NA, lift = NA),
+                       data.frame(effect = me1,est = NA,est_ci = NA, z = NA, p = NA, lift = NA),
+                       data.frame(effect = me2,est = NA, est_ci = NA,z = NA, p = NA, lift = NA))
+
+    fit <- do.call("glm", list(formula=f, data=df, family="binomial"))
+    fit_intx <- do.call("glm", list(formula=f_intx, data=df, family="binomial"))
+    fit_summary <- summary(fit)
+    fit_coeffs <- rownames_to_column(as.data.frame(fit_summary$coefficients), var = "term")
+    fit_cis <- as.data.frame(confint(fit))
+    #fit_coeffs$`Pr(>|z|)`[fit_coeffs$`Pr(>|z|)` < .001] <- '<.001'
+
+    fit_stats$est[1] <- round(plogis(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"]), 5)
+    fit_stats$est_ci[1] <- paste('[',round(plogis(fit_cis$`2.5 %`[1]), 5), ',', round(plogis(fit_cis$`97.5 %`[1]), 5), ']')
+
+    for (i in 2:nrow(fit_stats)) {
+      fit_stats$est[i] <- round(plogis(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i]), 5)
+      fit_stats$est_ci[i] <- paste('[',round(plogis(fit_cis$`2.5 %`[1] + fit_cis$`2.5 %`[i]), 5), ',', round(plogis(fit_cis$`2.5 %`[1] + fit_cis$`97.5 %`[i]), 5), ']')
+      fit_stats$z[i] <- round(fit_coeffs$`z value`[i], 3)
+      fit_stats$p[i] <- fit_coeffs$`Pr(>|z|)`[i]
+      fit_stats$lift[i] <- paste(round(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1], 3),'%')
+    }
+  }
+
+  if (family == "lm") {
+    fit_stats <- rbind(data.frame(effect = 'control',est = NA,est_ci=NA, t = NA, p = NA, lift = NA),
+                       data.frame(effect = me1,est = NA,est_ci = NA, t = NA, p = NA, lift = NA),
+                       data.frame(effect = me2,est = NA,est_ci = NA, t = NA, p = NA, lift = NA))
+
+    fit <- do.call("lm", list(formula=f, data=df))
+    fit_intx <- do.call("lm", list(formula=f_intx, data=df))
+    fit_summary <- summary(fit)
+    fit_coeffs <- rownames_to_column(as.data.frame(fit_summary$coefficients), var = "term")
+    fit_cis <- as.data.frame(confint(fit))
+    #fit_coeffs$`Pr(>|z|)`[fit_coeffs$`Pr(>|z|)` < .001] <- '<.001'
+
+    fit_stats$est[1] <- round(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"], 5)
+    fit_stats$est_ci[1] <- paste('[',round((fit_cis$`2.5 %`[1]), 5), ',', round((fit_cis$`97.5 %`[1]), 5), ']')
+
+    for (i in 2:nrow(fit_stats)) {
+      fit_stats$est[i] <- round(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i], 5)
+      fit_stats$est_ci[i] <- paste('[',round((fit_cis$`2.5 %`[1] + fit_cis$`2.5 %`[i]), 5), ',', round((fit_cis$`2.5 %`[1] + fit_cis$`97.5 %`[i]), 5), ']')
+      fit_stats$t[i] <- round(fit_coeffs$`t value`[i],5)
+      fit_stats$p[i] <- fit_coeffs$`Pr(>|t|)`[i]
+      fit_stats$lift[i] <- paste(round(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1], 5),'%')
+    }
+  }
+
+
+  if (family == "negbin") {
+    fit_stats <- rbind(data.frame(effect = 'control',est = NA,est_ci = NA, z = NA, p = NA, lift = NA),
+                       data.frame(effect = me1,est = NA, est_ci = NA, z = NA, p = NA, lift = NA),
+                       data.frame(effect = me2,est = NA, est_ci = NA, z = NA, p = NA, lift = NA))
+
+
+    fit <- do.call("glm.nb", list(formula=f, data=df))
+    fit_intx <- do.call("glm.nb", list(formula=f_intx, data=df))
+    fit_summary <- summary(fit)
+    fit_coeffs <- rownames_to_column(as.data.frame(fit_summary$coefficients), var = "term")
+    fit_cis <- as.data.frame(confint(fit))
+    #fit_coeffs$`Pr(>|z|)`[fit_coeffs$`Pr(>|z|)` < .001] <- '<.001'
+
+    fit_stats$est[1] <- round(exp(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"]), 3)
+    fit_stats$est_ci[1] <- paste('[',round(exp(fit_cis$`2.5 %`[1]), 5), ',', round(exp(fit_cis$`97.5 %`[1]), 5), ']')
+
+    for (i in 2:nrow(fit_stats)) {
+      fit_stats$est[i] <- round(exp(fit_coeffs$Estimate[fit_coeffs$term == "(Intercept)"] + fit_coeffs$Estimate[i]), 3)
+      fit_stats$est_ci[i] <- paste('[',round(exp(fit_cis$`2.5 %`[1] + fit_cis$`2.5 %`[i]), 5), ',', round(exp(fit_cis$`2.5 %`[1] + fit_cis$`97.5 %`[i]), 5), ']')
+      fit_stats$z[i] <- round(fit_coeffs$`z value`[i], 3)
+      fit_stats$p[i] <- fit_coeffs$`Pr(>|z|)`[i]
+      fit_stats$lift[i] <- paste(round(100* (fit_stats$est[i] - fit_stats$est[1]) / fit_stats$est[1], 3),'%')
+    }
+  }
+
+  `%notin%` <- Negate(`%in%`)
+  if (family %notin% c("logit","lm","negbin")) {
+    stop("Test family should be one of: logit, lm, negbin")
+  }
+
+
+  fit_final <- fit_stats %>%
+    dplyr::select(c(1,order(colnames(fit_stats)))) %>%
+    discard(~all(is.na(.) | . ==""))
+
+
+  lrtest_res <- lrtest(fit,fit_intx)
+
+  colnames(fit_final) <- gsub(" ", "", colnames(fit_final))
+
+  return(as.data.frame(cbind(outcome_variable = outcome, model_type = paste(family, ' main effects'), fit_final, intx_p = lrtest_res$`Pr(>Chisq)`[2])))
+}
