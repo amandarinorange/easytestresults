@@ -334,7 +334,6 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
               by = setNames(c(user_segment,"reference"),
                             c(user_segment,treatment_name))) %>%
     dplyr::select(-c("contrast","comparison")) %>%
-    filter(!is.na(p.value)) %>%
     pivot_wider(names_from = 3, values_from = c(1,4,5)) %>%
     setNames(nm = sub("(.*)_(.*)", "\\2_\\1", names(.))) %>%
     cbind(intx_lift,intx_cis)
