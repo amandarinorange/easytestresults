@@ -245,10 +245,12 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
   lrtest_res <- lrtest(fit_cov,fit_intx)
 
   if (family %in% c("logit","lm","negbin")) {
-    intx_plot <- do.call("cat_plot", list(model = fit_intx,
-                                          pred = as.name(treatment_name),
-                                          modx = as.name(user_segment),
-                                          colors = Polychrome::createPalette(N = length(levels(df[,segment_col_ind])) * length(levels(df[,treatment_col_ind])), seedcolors = c("#ff0000", "#00ff00", "#0000ff"))))
+    intx_plot <- suppressWarnings(do.call("cat_plot", list(model = fit_intx,
+                                                           pred = as.name(treatment_name),
+                                                           modx = as.name(user_segment),
+                                                           colors = brewer.pal(n = length(levels(df[,segment_col_ind])) *
+                                                                                 length(levels(df[,treatment_col_ind])),
+                                                                               name = "Set2"))))
 
     # Get confidence intervals
     intx_cis <- intx_plot$data %>%
@@ -288,10 +290,12 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
     # Point estimates -- cat_plot doesn't support zeroinfl models, so I'm running glm.nb on the same data just to get point estimates and relative lifts.
     ## reset fit_intx into a glm.nb object instead of zeroinfl
     fit_intx <- do.call("glm.nb", list(formula=f_intx, data=df))
-    intx_plot <- do.call("cat_plot", list(model = fit_intx,
-                                          pred = as.name(treatment_name),
-                                          modx = as.name(user_segment),
-                                          colors = Polychrome::createPalette(N = length(levels(df[,segment_col_ind])) * length(levels(df[,treatment_col_ind])), seedcolors = c("#ff0000", "#00ff00", "#0000ff"))))
+    intx_plot <- suppressWarnings(do.call("cat_plot", list(model = fit_intx,
+                                                           pred = as.name(treatment_name),
+                                                           modx = as.name(user_segment),
+                                                           colors = brewer.pal(n = length(levels(df[,segment_col_ind])) *
+                                                                                 length(levels(df[,treatment_col_ind])),
+                                                                               name = "Set2"))))
   }
 
   # Relative lift
@@ -328,15 +332,26 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
     dplyr::rename_with(~ "test_stat", .cols = dplyr::ends_with("ratio"))
 
   intx_stats <- intx_plot$data %>%
-    dplyr::select(c(1,2,3)) %>%
+    dplyr::select(c(1, 2, 3)) %>%
     dplyr::rename(est = 1) %>%
-    left_join(y = em_c_comparison,
-              by = setNames(c(user_segment,"reference"),
-                            c(user_segment,treatment_name))) %>%
-    dplyr::select(-c("contrast","comparison")) %>%
-    pivot_wider(names_from = 3, values_from = c(1,4,5)) %>%
-    setNames(nm = sub("(.*)_(.*)", "\\2_\\1", names(.))) %>%
+    left_join(
+      y = em_c_comparison,
+      by = setNames(c(user_segment, "reference"),
+                    c(user_segment, treatment_name))
+    ) %>%
+    dplyr::select(-c("contrast", "comparison")) %>%
+    filter(!is.na(p.value)) %>%
+    pivot_wider(
+      names_from = 3,
+      values_from = c(1, 4, 5)
+    ) %>%
+    {
+      pivoted_cols <- setdiff(names(.), names(intx_plot$data)[1:3])
+      names(.)[names(.) %in% pivoted_cols] <- sub("(.*)_(.*)", "\\2_\\1", pivoted_cols)
+      .
+    } %>%
     cbind(intx_lift,intx_cis)
+
 
   colnames(intx_stats) <- gsub(" ", "", colnames(intx_stats))
 
@@ -346,14 +361,12 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
 
   # sample sizes per cell
 
-  sample_sizes <- table(df[,treatment_col_ind][!is.na(df[outcome])], df[,segment_col_ind][!is.na(df[outcome])]) %>%
-    data.frame() %>%
-    dplyr::rename(treatment_name = Var1,
-                  user_segment = Var2,
-                  n = Freq) %>%
-    pivot_wider(names_from = c(treatment_name),
-                values_from = n,
-                names_glue = "{treatment_name}_n")
+  sample_sizes <- table(df[,treatment_col_ind][!is.na(df[[outcome]])], df[,segment_col_ind][!is.na(df[[outcome]])]) %>%
+    as.data.frame() %>%
+    setNames(c(treatment_name, user_segment, "n")) %>%
+    dplyr::mutate(stat = "n") %>%
+    pivot_wider(names_from = c(as.name(treatment_name), "stat"),
+                values_from = n)
 
 
   if (lrtest_res$`Pr(>Chisq)`[2] >= .05) {
@@ -363,17 +376,27 @@ easy_results_segmented <- function(outcome, treatment_name, user_segment, df, fa
                                       round(lrtest_res$`Pr(>Chisq)`[2], 3),
                                       ". Beware with interpreting results of treatment by ",
                                       user_segment)
-    return(cbind(outcome_variable = outcome, model_type = family, sample_sizes, intx_final, interaction_significance))
+    return(cbind(outcome_variable = outcome,
+                 model_type = family,
+                 sample_sizes %>% full_join(intx_final, by = (user_segment)),
+                 interaction_significance,
+                 interaction_p = round(lrtest_res$`Pr(>Chisq)`[2], 4)))
   }
 
   if (lrtest_res$`Pr(>Chisq)`[2] < .05) {
     interaction_significance <- paste("The interaction effect '",
                                       intx,
                                       "' is significant at p = ",
-                                      ifelse(test = lrtest_res$`Pr(>Chisq)`[2] < .001, yes = '<.001', no = round(lrtest_res$`Pr(>Chisq)`[2], 3)))
+                                      ifelse(test = lrtest_res$`Pr(>Chisq)`[2] < .001,
+                                             yes = '<.001',
+                                             no = round(lrtest_res$`Pr(>Chisq)`[2], 3)))
 
 
-    return(cbind(outcome_variable = outcome, model_type = family, sample_sizes, intx_final, interaction_significance))
+    return(cbind(outcome_variable = outcome,
+                 model_type = family,
+                 sample_sizes %>% full_join(intx_final, by = (user_segment)),
+                 interaction_significance,
+                 interaction_p = round(lrtest_res$`Pr(>Chisq)`[2], 4)))
   }
 
 }
